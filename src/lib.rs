@@ -6,6 +6,7 @@ use thiserror::Error;
 use zigzag::ZigZag;
 
 mod encoding;
+mod key_format;
 mod types;
 
 // NodeKey represents a key of node in the DB
@@ -273,14 +274,14 @@ mod tests {
     use super::*;
     use hex::ToHex;
     use rand::Rng;
+    use rstest::rstest;
 
     fn generate_random_bytes(n: usize) -> Vec<u8> {
         let mut rng = rand::rng();
         (0..n).map(|_| rng.random::<u8>()).collect()
     }
 
-    #[test]
-    fn test_node_encoded_size() {
+    fn create_test_node() -> Box<Node> {
         let node_key = NodeKey {
             version: types::U63::new(1).unwrap(),
             nonce: types::U31::new(1).unwrap(),
@@ -288,7 +289,7 @@ mod tests {
 
         let node_key = Box::new(node_key);
 
-        let mut node = Node {
+        let node = Node {
             key: generate_random_bytes(10),
             value: Some(generate_random_bytes(10)),
             subtree_height: types::U7::new(0).unwrap(),
@@ -301,29 +302,46 @@ mod tests {
             right_node: None,
         };
 
+        Box::new(node)
+    }
+
+    #[test]
+    fn test_leaf_node_encoded_size() {
+        let node = create_test_node();
+
         // leaf node
         assert_eq!(node.serialize().unwrap().len(), 25);
+    }
 
-        // non-leaf node
+    #[test]
+    fn test_non_leaf_node_encoded_size() {
+        let mut node = create_test_node();
+
+        // make it non-leaf node
         // -1 to remove the extra mode (isLegacy) encoded byte
         node.subtree_height = types::U7::new(1).unwrap();
         assert_eq!(node.serialize().unwrap().len() - 1, 39);
     }
 
-    #[test]
-    fn test_node_encode_decode() {
-        let child_node_key = NodeKey {
+    fn child_node() -> (Box<NodeKey>, Vec<u8>) {
+        let node_key = NodeKey {
             version: types::U63::new(1).unwrap(),
             nonce: types::U31::new(1).unwrap(),
         };
 
-        let child_node_key = Box::new(child_node_key);
+        let node_key = Box::new(node_key);
 
-        let child_node_hash = vec![
+        let node_hash = vec![
             0x7f, 0x68, 0x90, 0xca, 0x16, 0xde, 0xa6, 0xe8, 0x89, 0x3d, 0x96, 0xf0, 0xa3, 0xd, 0xa,
             0x14, 0xe5, 0x55, 0x59, 0xfc, 0x9b, 0x83, 0x4, 0x91, 0xe3, 0xd2, 0x45, 0x1c, 0x81,
             0xf6, 0xd1, 0xe,
         ];
+
+        (node_key, node_hash)
+    }
+
+    fn inner_node() -> Box<Node> {
+        let (child_node_key, child_node_hash) = child_node();
 
         let inner_node = Node {
             subtree_height: types::U7::new(3).unwrap(),
@@ -343,6 +361,10 @@ mod tests {
 
         let inner_node = Box::new(inner_node);
 
+        inner_node
+    }
+
+    fn leaf_node() -> Box<Node> {
         let leaf_node = Node {
             subtree_height: types::U7::new(0).unwrap(),
             size: types::U63::new(1).unwrap(),
@@ -365,23 +387,30 @@ mod tests {
 
         let leaf_node = Box::new(leaf_node);
 
-        let tests = vec![
-            (
-                Some(inner_node),
-                "060e036b6579207f6890ca16dea6e8893d96f0a30d0a14e55559fc9b830491e3d2451c81f6d10e0002020202",
-            ),
-            (Some(leaf_node), "0002036b65790576616c7565"),
-        ];
+        leaf_node
+    }
 
-        for t in tests {
-            let test_node = t.0.unwrap();
-            let serialize = test_node.serialize().unwrap();
+    #[rstest]
+    #[case(
+        inner_node(),
+        "060e036b6579207f6890ca16dea6e8893d96f0a30d0a14e55559fc9b830491e3d2451c81f6d10e0002020202"
+    )]
+    #[case(leaf_node(), "0002036b65790576616c7565")]
+    fn test_node_encode(#[case] node: Box<Node>, #[case] expected: String) {
+        let encoded = node.serialize().unwrap();
+        let hash = encoded.encode_hex::<String>();
+        assert_eq!(hash, expected);
+    }
 
-            let hash = serialize.encode_hex::<String>();
-            assert_eq!(t.1, hash);
-
-            let node = Node::make_node(&test_node.get_key().unwrap(), &serialize).unwrap();
-            assert_eq!(test_node, node);
-        }
+    #[rstest]
+    #[case(
+        inner_node(),
+        "060e036b6579207f6890ca16dea6e8893d96f0a30d0a14e55559fc9b830491e3d2451c81f6d10e0002020202"
+    )]
+    #[case(leaf_node(), "0002036b65790576616c7565")]
+    fn test_node_decode(#[case] node: Box<Node>, #[case] expected: String) {
+        let encoded = node.serialize().unwrap();
+        let decoded = Node::make_node(&node.get_key().unwrap(), &encoded).unwrap();
+        assert_eq!(decoded, node);
     }
 }

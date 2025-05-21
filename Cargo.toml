@@ -12,3 +12,4 @@ zigzag = "0.1.0"
 [dev-dependencies]
 hex = "0.4.3"
 rand = "0.9.1"
+rstest = "0.25"
