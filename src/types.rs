@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, Copy)]
@@ -10,6 +12,7 @@ pub trait BoundedUintTrait<U, I> {
     fn new(x: U) -> Result<BoundedUint<U, I>, BoundedUintError>;
     fn as_signed(&self) -> I;
     fn to_be_bytes(&self) -> Vec<u8>;
+    fn cmp(&self, x: BoundedUint<U, I>) -> Ordering;
 }
 
 #[derive(Error, Debug)]
@@ -37,6 +40,10 @@ macro_rules! impl_bounded_uint {
 
             fn to_be_bytes(&self) -> Vec<u8> {
                 self.value.to_be_bytes().to_vec()
+            }
+
+            fn cmp(&self, x: BoundedUint<$u, $i>) -> Ordering {
+                self.value.cmp(&x.value)
             }
         }
     };

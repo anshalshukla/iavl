@@ -3,9 +3,12 @@ use encoding::{encode_32bytes_hash, encode_bytes};
 use prost::encoding as prost_encoding;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use types::{U31, U63};
 use zigzag::ZigZag;
 
+mod db;
 mod encoding;
+mod fast_node;
 mod key_format;
 mod types;
 
@@ -45,9 +48,49 @@ pub enum NodeError {
     TypesError(#[from] types::BoundedUintError),
 }
 
-const NODE_KEY_LENGTH: usize = 12;
+const VERSION_BYTE_LENGTH: usize = 8;
+const NONCE_BYTE_LENGTH: usize = 4;
+
+const NODE_KEY_LENGTH: usize = VERSION_BYTE_LENGTH + NONCE_BYTE_LENGTH;
 // non legacy
 const MODE: u64 = 0;
+
+impl NodeKey {
+    fn serialize(&self) -> Vec<u8> {
+        let mut result = Vec::new();
+        let version = ZigZag::encode(self.version.as_signed());
+        let nonce = ZigZag::encode(self.nonce.as_signed());
+
+        prost_encoding::encode_varint(version, &mut result);
+        prost_encoding::encode_varint(nonce.into(), &mut result);
+        result
+    }
+
+    fn get_node_key(key: &[u8]) -> Option<Box<Self>> {
+        if key.len() != NODE_KEY_LENGTH {
+            return None;
+        }
+
+        let version: [u8; VERSION_BYTE_LENGTH] = key[..VERSION_BYTE_LENGTH].try_into().ok()?;
+        let nonce: [u8; NONCE_BYTE_LENGTH] = key[VERSION_BYTE_LENGTH..].try_into().ok()?;
+
+        let version = u64::from_be_bytes(version);
+        let nonce = u32::from_be_bytes(nonce);
+
+        Some(Box::new(NodeKey {
+            version: U63::new(version).unwrap(),
+            nonce: U31::new(nonce).unwrap(),
+        }))
+    }
+
+    fn get_root_key(version: U63) -> Vec<u8> {
+        let mut result = Vec::with_capacity(NODE_KEY_LENGTH);
+        result.extend(version.to_be_bytes());
+        result.extend_from_slice(&U31::new(1).unwrap().to_be_bytes());
+
+        result
+    }
+}
 
 impl TryFrom<&[u8]> for NodeKey {
     type Error = NodeError;
@@ -149,11 +192,8 @@ impl Node {
                 .ok_or_else(|| NodeError::SerializationError("right node key is none".into()))?;
 
             for node_key in [left, right] {
-                let version = ZigZag::encode(node_key.version.as_signed());
-                let nonce = ZigZag::encode(node_key.nonce.as_signed());
-
-                prost_encoding::encode_varint(version, &mut result);
-                prost_encoding::encode_varint(nonce.into(), &mut result);
+                let nk_encoded = node_key.serialize();
+                result.extend_from_slice(&nk_encoded);
             }
         }
 
@@ -198,7 +238,7 @@ impl Node {
         Ok(result)
     }
 
-    fn make_node(node_key: &[u8], node: &[u8]) -> Result<Box<Node>, NodeError> {
+    fn deserialize(node_key: &[u8], node: &[u8]) -> Result<Box<Node>, NodeError> {
         let mut node = node;
 
         // Decode subtree height
@@ -410,7 +450,7 @@ mod tests {
     #[case(leaf_node(), "0002036b65790576616c7565")]
     fn test_node_decode(#[case] node: Box<Node>, #[case] expected: String) {
         let encoded = node.serialize().unwrap();
-        let decoded = Node::make_node(&node.get_key().unwrap(), &encoded).unwrap();
+        let decoded = Node::deserialize(&node.get_key().unwrap(), &encoded).unwrap();
         assert_eq!(decoded, node);
     }
 }
