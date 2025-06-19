@@ -14,6 +14,8 @@ const SIZE_U64: usize = size_of::<u64>();
 const SIZE_U32: usize = size_of::<u32>();
 
 impl<const P: u8> FastKeyFormat<P> {
+    pub const LENGTH: usize = SIZE_U64 + SIZE_U32;
+
     pub fn extract_version_nonce(bytes: &[u8]) -> Option<(U63, U31)> {
         let _prefix = &bytes[0..1];
         let version: [u8; SIZE_U64] = bytes[1..1 + SIZE_U64].try_into().ok()?;
@@ -40,9 +42,15 @@ impl<const P: u8> FastKeyFormat<P> {
     pub fn new(v: U63, n: U31) -> Self {
         FastKeyFormat::<P>(v, n)
     }
+
+    pub fn length() -> usize {
+        SIZE_U64 + SIZE_U32
+    }
 }
 
 impl<const P: u8> FastKeyPrefixFormat<P> {
+    pub const LENGTH: usize = SIZE_U64;
+
     pub fn extract_version(bytes: &[u8]) -> Option<U63> {
         let _prefix = &bytes[0..1];
         let version: [u8; SIZE_U64] = bytes[1..1 + SIZE_U64].try_into().ok()?;
@@ -64,6 +72,14 @@ impl<const P: u8> FastKeyPrefixFormat<P> {
 
     pub fn new(v: U63) -> Self {
         FastKeyPrefixFormat::<P>(v)
+    }
+
+    pub fn prefix() -> u8 {
+        P
+    }
+
+    pub fn length() -> usize {
+        SIZE_U64
     }
 }
 

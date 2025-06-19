@@ -1,4 +1,12 @@
-use crate::types::BoundedUintTrait;
+use std::{
+    cmp::Ordering,
+    sync::{Arc, Mutex, PoisonError, RwLock},
+};
+
+use crate::{
+    immutable_tree::ImmutableTree, iterator::Traversal, node_db::KVStoreWithBatch,
+    types::BoundedUintTrait,
+};
 use encoding::{encode_32bytes_hash, encode_bytes};
 use prost::encoding as prost_encoding;
 use sha2::{Digest, Sha256};
@@ -6,10 +14,14 @@ use thiserror::Error;
 use types::{U31, U63};
 use zigzag::ZigZag;
 
-mod db;
-mod encoding;
+pub mod db;
+pub mod encoding;
+pub mod error;
 mod fast_node;
+mod immutable_tree;
+pub mod iterator;
 mod key_format;
+mod node_db;
 mod types;
 
 // NodeKey represents a key of node in the DB
@@ -20,17 +32,17 @@ pub struct NodeKey {
 }
 
 // Node represents a node in a Tree
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Debug, Clone)]
 pub struct Node {
-    key: Vec<u8>,                         // key for the node.
-    value: Option<Vec<u8>>,               // value of leaf node. If inner node, value = None
+    key: Vec<u8>,                          // key for the node.
+    value: Option<Vec<u8>>,                // value of leaf node. If inner node, value = None
     hash: Vec<u8>, // hash of above field and left node's hash, right node's hash
     node_key: Option<Box<NodeKey>>, // node key of the nodeDB
     left_node_key: Option<Box<NodeKey>>, // node key of the left child
     right_node_key: Option<Box<NodeKey>>, // node key of the right child
     size: types::U63, // number of leaves that are under the current node. Leaf nodes have size = 1
-    left_node: Option<Box<Node>>, // pointer to left child
-    right_node: Option<Box<Node>>, // pointer to right child
+    left_node: Option<Arc<RwLock<Node>>>, // pointer to left child
+    right_node: Option<Arc<RwLock<Node>>>, // pointer to right child
     subtree_height: types::U7, // height of the node. Leaf nodes have height 0
 }
 
@@ -46,6 +58,21 @@ pub enum NodeError {
     GetKeyError,
     #[error("types")]
     TypesError(#[from] types::BoundedUintError),
+
+    #[error("no root node")]
+    NoRootNode,
+
+    #[error("db error")]
+    DBError,
+
+    #[error("other error")]
+    Poison,
+}
+
+impl<T> From<PoisonError<T>> for NodeError {
+    fn from(_: PoisonError<T>) -> Self {
+        NodeError::Poison
+    }
 }
 
 const VERSION_BYTE_LENGTH: usize = 8;
@@ -66,7 +93,7 @@ impl NodeKey {
         result
     }
 
-    fn get_node_key(key: &[u8]) -> Option<Box<Self>> {
+    fn get_node_key(key: &[u8]) -> Option<Self> {
         if key.len() != NODE_KEY_LENGTH {
             return None;
         }
@@ -77,10 +104,10 @@ impl NodeKey {
         let version = u64::from_be_bytes(version);
         let nonce = u32::from_be_bytes(nonce);
 
-        Some(Box::new(NodeKey {
+        Some(NodeKey {
             version: U63::new(version).unwrap(),
             nonce: U31::new(nonce).unwrap(),
-        }))
+        })
     }
 
     fn get_root_key(version: U63) -> Vec<u8> {
@@ -152,6 +179,39 @@ impl Node {
         self.hash = hash.to_vec();
 
         Ok(hash.to_vec())
+    }
+
+    fn hash_with_count(&mut self, version: types::U63) -> Result<Vec<u8>, NodeError> {
+        if self.hash.is_empty() {
+            let hash = self.write_hash_bytes_recursively(version);
+            if hash.is_err() {
+                panic!("failed to write hash bytes recursively");
+            }
+
+            self.hash = hash.unwrap();
+        }
+
+        Ok(self.hash.clone())
+    }
+
+    fn write_hash_bytes_recursively(&mut self, version: types::U63) -> Result<Vec<u8>, NodeError> {
+        if self.left_node.is_some() {
+            self.left_node
+                .as_ref()
+                .unwrap()
+                .write()?
+                .hash_with_count(version);
+        }
+
+        if self.right_node.is_some() {
+            self.right_node
+                .as_ref()
+                .unwrap()
+                .write()?
+                .hash_with_count(version);
+        }
+
+        self.calculate_hash_bytes(version)
     }
 
     // Serializes the node as a byte slice
@@ -231,8 +291,10 @@ impl Node {
                 (Some(l), Some(r)) => (l, r),
                 _ => return Err(NodeError::HashingError("left or right node is None".into())),
             };
-            result.extend_from_slice(&encode_32bytes_hash(&left.hash));
-            result.extend_from_slice(&encode_32bytes_hash(&right.hash));
+
+            // TODO: handle the error
+            result.extend_from_slice(&encode_32bytes_hash(&left.read()?.hash));
+            result.extend_from_slice(&encode_32bytes_hash(&right.read()?.hash));
         }
 
         Ok(result)
@@ -306,6 +368,243 @@ impl Node {
         }
 
         Ok(Box::new(result))
+    }
+
+    fn get_right_node_key(&self) -> Option<Box<NodeKey>> {
+        self.right_node_key.clone()
+    }
+
+    fn get_left_node_key(&self) -> Option<Box<NodeKey>> {
+        self.left_node_key.clone()
+    }
+
+    fn get_right_node<DB: KVStoreWithBatch>(
+        &self,
+        tree: &ImmutableTree<DB>,
+    ) -> Option<Arc<RwLock<Node>>> {
+        if let Some(right_node) = self.right_node.as_ref() {
+            return Some(right_node.clone());
+        }
+
+        let right_node_key = self.right_node_key.clone();
+        if let Some(right_node_key) = right_node_key {
+            let right_node = tree.ndb.get_node(right_node_key.serialize());
+            if right_node.is_err() {
+                return None;
+            }
+            Some(right_node.unwrap().clone())
+        } else {
+            None
+        }
+    }
+
+    fn get_left_node<DB: KVStoreWithBatch>(
+        &self,
+        tree: &ImmutableTree<DB>,
+    ) -> Option<Arc<RwLock<Node>>> {
+        if let Some(left_node) = self.left_node.as_ref() {
+            return Some(left_node.clone());
+        }
+
+        let left_node_key = self.left_node_key.clone();
+        if let Some(left_node_key) = left_node_key {
+            let left_node = tree.ndb.get_node(left_node_key.serialize());
+            if left_node.is_err() {
+                return None;
+            }
+            Some(left_node.unwrap().clone())
+        } else {
+            None
+        }
+    }
+
+    fn has<DB: KVStoreWithBatch>(
+        &self,
+        tree: &ImmutableTree<DB>,
+        key: &Vec<u8>,
+    ) -> Result<bool, NodeError> {
+        if self.key == *key {
+            return Ok(true);
+        }
+        if self.is_leaf() {
+            return Ok(false);
+        }
+        if key < &self.key {
+            let left_node = self.get_left_node(tree);
+            if left_node.is_none() {
+                return Ok(false);
+            }
+            return left_node.unwrap().read().unwrap().has(tree, key);
+        }
+
+        let right_node = self.get_right_node(tree);
+        if right_node.is_none() {
+            return Ok(false);
+        }
+
+        right_node.unwrap().read().unwrap().has(tree, key)
+    }
+
+    fn new_traversal<DB: KVStoreWithBatch>(
+        &self,
+        tree: Arc<ImmutableTree<DB>>,
+        start: &[u8],
+        end: &[u8],
+        ascending: bool,
+        inclusive: bool,
+        post: bool,
+    ) -> Traversal<DB> {
+        let mut trans = Traversal::new_traversal(
+            tree,
+            start.to_vec(),
+            end.to_vec(),
+            ascending,
+            inclusive,
+            post,
+        );
+
+        let node = Arc::new(RwLock::new(self.clone()));
+
+        trans.delayed_nodes.push(node, true);
+
+        trans
+    }
+
+    // Get a key under the node.
+    //
+    // The index is the index in the list of leaf nodes sorted lexicographically by key. The leftmost leaf has index 0.
+    // It's neighbor has index 1 and so on.
+    fn get_index<DB: KVStoreWithBatch>(
+        &self,
+        tree: &ImmutableTree<DB>,
+        key: &Vec<u8>,
+    ) -> Result<(i64, Vec<u8>), NodeError> {
+        if self.is_leaf() {
+            match self.key.cmp(key) {
+                Ordering::Less => return Ok((1, vec![])),
+                Ordering::Greater => return Ok((0, vec![])),
+                Ordering::Equal => return Ok((0, self.value.clone().unwrap_or_default())),
+            }
+        }
+
+        if key < &self.key {
+            let left_node = self.get_left_node(tree);
+            if left_node.is_none() {
+                return Err(NodeError::GetKeyError);
+            }
+            return left_node.unwrap().read().unwrap().get_index(tree, key);
+        }
+
+        let right_node = self.get_right_node(tree);
+        if right_node.is_none() {
+            return Err(NodeError::GetKeyError);
+        }
+
+        let (mut index, value) = right_node
+            .as_ref()
+            .unwrap()
+            .read()
+            .unwrap()
+            .get_index(tree, key)?;
+
+        index += self.size.as_signed() - right_node.unwrap().read().unwrap().size.as_signed();
+
+        return Ok((index, value));
+    }
+
+    fn get_by_index<DB: KVStoreWithBatch>(
+        &self,
+        tree: &ImmutableTree<DB>,
+        index: i64,
+    ) -> Result<(Vec<u8>, Vec<u8>), NodeError> {
+        if self.is_leaf() {
+            if index == 0 {
+                return Ok((self.key.clone(), self.value.clone().unwrap_or_default()));
+            }
+            return Err(NodeError::GetKeyError);
+        }
+        // TODO: could improve this by storing the
+        // sizes as well as left/right hash.
+        let left_node = self.get_left_node(tree);
+        if left_node.is_none() {
+            return Err(NodeError::GetKeyError);
+        }
+
+        if index < left_node.as_ref().unwrap().read().unwrap().size.as_signed() {
+            return left_node.unwrap().read().unwrap().get_by_index(tree, index);
+        }
+
+        let right_node = self.get_right_node(tree);
+        if right_node.is_none() {
+            return Err(NodeError::GetKeyError);
+        }
+
+        return right_node.as_ref().unwrap().read().unwrap().get_by_index(
+            tree,
+            index - left_node.unwrap().read().unwrap().size.as_signed(),
+        );
+    }
+
+    // Get finds a key under the node and returns whether it was found and its value
+    fn get<DB: KVStoreWithBatch>(
+        &self,
+        tree: &ImmutableTree<DB>,
+        key: &[u8],
+    ) -> Result<(i64, Option<Vec<u8>>), NodeError> {
+        if self.is_leaf() {
+            if self.key.as_slice() == key {
+                return Ok((0, self.value.clone()));
+            }
+            return Ok((0, None));
+        }
+
+        if key < self.key.as_slice() {
+            let left_node = self.get_left_node(tree);
+            if left_node.is_none() {
+                return Ok((0, None));
+            }
+            return left_node.unwrap().read().unwrap().get(tree, key);
+        }
+
+        let right_node = self.get_right_node(tree);
+        if right_node.is_none() {
+            return Ok((0, None));
+        }
+
+        let (mut index, value) = right_node
+            .as_ref()
+            .unwrap()
+            .read()
+            .unwrap()
+            .get(tree, key)?;
+        index += self.size.as_signed() - right_node.unwrap().read().unwrap().size.as_signed();
+        Ok((index, value))
+    }
+
+    fn traverse_in_range<DB: KVStoreWithBatch, F>(
+        &self,
+        tree: Arc<ImmutableTree<DB>>,
+        start: &[u8],
+        end: &[u8],
+        ascending: bool,
+        inclusive: bool,
+        post: bool,
+        cb: F,
+    ) -> Result<bool, NodeError>
+    where
+        F: Fn(&Node) -> bool,
+    {
+        let mut stop = false;
+        let mut t = self.new_traversal(tree, start, end, ascending, inclusive, post);
+        while let Ok(Some(node2)) = t.next() {
+            let node2 = node2.read()?;
+
+            stop = cb(&node2);
+            if stop {
+                return Ok(stop);
+            }
+        }
+        Ok(stop)
     }
 }
 
@@ -450,7 +749,14 @@ mod tests {
     #[case(leaf_node(), "0002036b65790576616c7565")]
     fn test_node_decode(#[case] node: Box<Node>, #[case] expected: String) {
         let encoded = node.serialize().unwrap();
-        let decoded = Node::deserialize(&node.get_key().unwrap(), &encoded).unwrap();
-        assert_eq!(decoded, node);
+        let mut decoded = Node::deserialize(&node.get_key().unwrap(), &encoded).unwrap();
+        assert_eq!(decoded.hash, node.hash);
+        assert_eq!(decoded.key, node.key);
+        assert_eq!(decoded.value, node.value);
+        assert_eq!(decoded.subtree_height, node.subtree_height);
+        assert_eq!(decoded.size, node.size);
+        assert_eq!(decoded.node_key, node.node_key);
+        assert_eq!(decoded.left_node_key, node.left_node_key);
+        assert_eq!(decoded.right_node_key, node.right_node_key);
     }
 }
