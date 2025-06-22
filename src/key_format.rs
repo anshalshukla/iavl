@@ -17,6 +17,10 @@ impl<const P: u8> FastKeyFormat<P> {
     pub const LENGTH: usize = SIZE_U64 + SIZE_U32;
 
     pub fn extract_version_nonce(bytes: &[u8]) -> Option<(U63, U31)> {
+        if bytes.len() != SIZE_U64 + SIZE_U32 + 1 {
+            return None;
+        }
+
         let _prefix = &bytes[0..1];
         let version: [u8; SIZE_U64] = bytes[1..1 + SIZE_U64].try_into().ok()?;
         let nonce: [u8; SIZE_U32] = bytes[1 + SIZE_U64..].try_into().ok()?;

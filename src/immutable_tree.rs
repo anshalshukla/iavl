@@ -19,7 +19,7 @@ where
     DB: KVStoreWithBatch,
 {
     /// Root node of the tree
-    pub root: Option<Arc<RwLock<Node>>>,
+    pub root: Arc<RwLock<Node>>,
 
     /// Root node of the tree
     //    pub root: Option<Node>,
@@ -40,7 +40,7 @@ where
     DB: KVStoreWithBatch,
 {
     pub fn new(
-        root: Option<Arc<RwLock<Node>>>,
+        root: Arc<RwLock<Node>>,
         ndb: Arc<NodeDB<DB>>,
         version: U63,
         skip_fast_storage_upgrade: bool,
@@ -60,20 +60,13 @@ where
 
     // Has returns whether or not a key exists.
     pub fn has(&self, key: &Vec<u8>) -> Result<bool, NodeError> {
-        if self.root.is_none() {
-            return Ok(false);
-        }
-        return self.root.as_ref().unwrap().read()?.has(self, key);
+        return self.root.read()?.has(self, key);
     }
 
     // Size returns the number of leaf nodes in the tree.
     pub fn size(&self) -> U63 {
-        if self.root.is_none() {
-            return U63::zero();
-        }
-
         // TODO: check if this is correct way to handle the error
-        let root = self.root.as_ref().unwrap().read();
+        let root = self.root.read();
         if root.is_err() {
             return U63::zero();
         }
@@ -88,11 +81,7 @@ where
 
     // Height returns the height of the tree.
     pub fn height(&self) -> U7 {
-        if self.root.is_none() {
-            return U7::zero();
-        }
-
-        let root = self.root.as_ref().unwrap().read();
+        let root = self.root.read();
         if root.is_err() {
             return U7::zero();
         }
@@ -102,14 +91,8 @@ where
 
     // Hash returns the root hash.
     pub fn hash(&self) -> Result<Vec<u8>, NodeError> {
-        if self.root.is_none() {
-            return Err(NodeError::NoRootNode);
-        }
-
         return self
             .root
-            .as_ref()
-            .unwrap()
             .write()?
             .hash_with_count(U63::new(self.version.get() + 1)?);
     }
@@ -121,25 +104,12 @@ where
     // The index is the index in the list of leaf nodes sorted lexicographically by key. The leftmost leaf has index 0.
     // Its neighbor has index 1 and so on.
     pub fn get_with_index(&self, key: &[u8]) -> Result<(i64, Option<Vec<u8>>), NodeError> {
-        if self.root.is_none() {
-            return Ok((0, None));
-        }
-
-        return self.root.as_ref().unwrap().read()?.get(self, key);
+        return self.root.read()?.get(self, key);
     }
 
     // GetByIndex gets the key and value at the specified index.
     pub fn get_by_index(&self, index: i64) -> Result<(Vec<u8>, Vec<u8>), NodeError> {
-        if self.root.is_none() {
-            return Err(NodeError::NoRootNode);
-        }
-
-        return self
-            .root
-            .as_ref()
-            .unwrap()
-            .read()?
-            .get_by_index(self, index);
+        return self.root.read()?.get_by_index(self, index);
     }
 
     // Get returns the value of the specified key if it exists, or None.
@@ -147,12 +117,6 @@ where
     // Get potentially employs a more performant strategy than GetWithIndex for retrieving the value.
     // If tree.skip_fast_storage_upgrade is true, this will work almost the same as GetWithIndex.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, NodeError> {
-        if self.root.is_none() {
-            return Ok(None);
-        }
-
-        let root = self.root.as_ref().unwrap();
-
         if !self.skip_fast_storage_upgrade {
             todo!()
             // TODO: Implement fast storage optimization
@@ -160,7 +124,7 @@ where
         }
 
         // Use regular strategy for reading from the current tree
-        let (_, result) = root.read()?.get(self, key)?;
+        let (_, result) = self.root.read()?.get(self, key)?;
         Ok(result)
     }
 
@@ -170,10 +134,6 @@ where
         self: Arc<Self>,
         callback: fn(&Vec<u8>, Option<Vec<u8>>) -> bool,
     ) -> Result<bool, NodeError> {
-        if self.root.is_none() {
-            return Ok(false);
-        }
-
         let mut iter = self.iterator(&[], &[], true)?;
 
         while iter.valid() {
@@ -196,7 +156,8 @@ where
         if !self.skip_fast_storage_upgrade {
             todo!()
         }
-        return Ok(Iterator::new(start, end, ascending, self));
+        //TODO: confirm the default values for inclusive and post
+        return Ok(Iterator::new(start, end, ascending, false, false, self));
     }
 
     // IterateRange makes a callback for all nodes with key between start and end non-inclusive.
@@ -209,10 +170,6 @@ where
         ascending: bool,
         callback: fn(&[u8], &[u8]) -> bool,
     ) -> Result<bool, NodeError> {
-        if self.root.is_none() {
-            return Ok(false);
-        };
-
         let fb = |node: &Node| -> bool {
             if node.is_leaf() {
                 if let Some(ref value) = node.value {
@@ -222,9 +179,8 @@ where
             false
         };
 
-        let root = self.root.as_ref().unwrap();
-
-        root.read()?
+        self.root
+            .read()?
             .traverse_in_range(self.clone(), start, end, ascending, false, false, fb)
     }
 
@@ -238,10 +194,6 @@ where
         ascending: bool,
         callback: fn(&[u8], &[u8], i64) -> bool,
     ) -> Result<bool, NodeError> {
-        if self.root.is_none() {
-            return Ok(false);
-        }
-
         let fb = |node: &Node| -> bool {
             if node.is_leaf() {
                 if let (Some(value), Some(node_key)) = (&node.value, &node.node_key) {
@@ -251,8 +203,8 @@ where
             false
         };
 
-        let root = self.root.as_ref().unwrap();
-        root.read()?
+        self.root
+            .read()?
             .traverse_in_range(self.clone(), start, end, ascending, true, false, fb)
     }
 
@@ -268,15 +220,15 @@ where
     // nodeSize is like Size, but includes inner nodes too.
     // used only for testing.
     pub fn node_size(&self) -> i64 {
-        if self.root.is_none() {
-            return 0;
-        }
-
-        let root = self.root.as_ref().unwrap().read();
+        let root = self.root.read();
         if root.is_err() {
             return 0;
         }
 
         return root.unwrap().size.as_signed() * 2 - 1;
+    }
+
+    pub fn get_root(&self) -> Arc<RwLock<Node>> {
+        self.root.clone()
     }
 }

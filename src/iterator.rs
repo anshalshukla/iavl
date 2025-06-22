@@ -1,13 +1,14 @@
 use std::sync::{Arc, RwLock};
 
 use crate::{
-    Node,
+    Node, NodeKey,
     immutable_tree::ImmutableTree,
     node_db::{DBError, KVStoreWithBatch, NodeDB},
+    types::{BoundedUintTrait, U7, U31, U63},
 };
 
 #[derive(Clone)]
-struct DelayedNode {
+pub struct DelayedNode {
     node: Arc<RwLock<Node>>,
     delayed: bool,
 }
@@ -286,22 +287,33 @@ where
     DB: KVStoreWithBatch,
 {
     /// Returns a new iterator over the immutable tree. If the tree is None, the iterator will be invalid.
-    pub fn new(start: &[u8], end: &[u8], ascending: bool, tree: Arc<ImmutableTree<DB>>) -> Self {
+    pub fn new(
+        start: &[u8],
+        end: &[u8],
+        ascending: bool,
+        inclusive: bool,
+        post: bool,
+        tree: Arc<ImmutableTree<DB>>,
+    ) -> Self {
+        let root = tree.get_root();
+
         let mut iter = Iterator {
             start: start.into(),
             end: end.into(),
             key: Vec::new(),
             value: None,
-            valid: false,
+            valid: true,
             traversal: Traversal::new_traversal(
                 tree,
                 start.into(),
                 end.into(),
                 ascending,
-                false,
-                false,
+                inclusive,
+                post,
             ),
         };
+
+        iter.traversal.delayed_nodes.push(root, true);
 
         iter.next();
 
@@ -333,6 +345,7 @@ where
         let next_node = self.traversal.next();
 
         if next_node.is_err() {
+            println!("Testing log: next_node error: {:?}", next_node.err());
             self.valid = false;
             return;
         }
@@ -341,6 +354,8 @@ where
             Ok(Some(node)) => {
                 let node = node.as_ref().read();
                 if node.is_err() {
+                    println!("Testing log: next_node error:7");
+
                     self.valid = false;
                     return;
                 }
@@ -356,11 +371,17 @@ where
                 self.next();
             }
             Ok(None) => {
+                println!("Testing log: next_node error:8");
+
                 self.valid = false;
+                return;
             }
             Err(err) => {
+                println!("Testing log: next_node error:1 {:?}", err);
+
                 // Error occurred
                 self.valid = false;
+                return;
             }
         }
     }
@@ -368,5 +389,400 @@ where
     /// IsFast returns true if iterator uses fast strategy
     pub fn is_fast(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::{MockDB, TestUtils};
+
+    // /// Test configuration for iterator tests
+    // #[derive(Clone)]
+    // pub struct IteratorTestConfig {
+    //     pub start_byte_to_set: u8,
+    //     pub end_byte_to_set: u8,
+    //     pub start_iterate: Option<Vec<u8>>,
+    //     pub end_iterate: Option<Vec<u8>>,
+    //     pub ascending: bool,
+    // }
+
+    // /// Setup test data for iterator testing
+    // pub fn setup_test_data(config: &IteratorTestConfig) -> Vec<(Vec<u8>, Vec<u8>)> {
+    //     let mut data = Vec::new();
+
+    //     for i in config.start_byte_to_set..=config.end_byte_to_set {
+    //         let key = vec![i];
+    //         let value = format!("value_{}", i as char).into_bytes();
+    //         data.push((key, value));
+    //     }
+
+    //     data
+    // }
+
+    // /// Create test configuration for various test scenarios
+    // pub fn create_test_configs() -> Vec<IteratorTestConfig> {
+    //     vec![
+    //         // Empty range
+    //         IteratorTestConfig {
+    //             start_byte_to_set: b'a',
+    //             end_byte_to_set: b'z',
+    //             start_iterate: Some(b"e".to_vec()),
+    //             end_iterate: Some(b"w".to_vec()),
+    //             ascending: true,
+    //         },
+    //         // Normal range ascending
+    //         IteratorTestConfig {
+    //             start_byte_to_set: b'a',
+    //             end_byte_to_set: b'z',
+    //             start_iterate: Some(b"e".to_vec()),
+    //             end_iterate: Some(b"w".to_vec()),
+    //             ascending: false,
+    //         },
+    //         // Normal range descending
+    //         IteratorTestConfig {
+    //             start_byte_to_set: b'a',
+    //             end_byte_to_set: b'z',
+    //             start_iterate: None,
+    //             end_iterate: None,
+    //             ascending: true,
+    //         },
+    //         // Full range ascending
+    //         IteratorTestConfig {
+    //             start_byte_to_set: b'a',
+    //             end_byte_to_set: b'z',
+    //             start_iterate: None,
+    //             end_iterate: None,
+    //             ascending: false,
+    //         },
+    //         // Full range descending
+    //         IteratorTestConfig {
+    //             start_byte_to_set: b'a',
+    //             end_byte_to_set: b'z',
+    //             start_iterate: None,
+    //             end_iterate: None,
+    //             ascending: false,
+    //         },
+    //     ]
+    // }
+
+    // // Helper function to create test configurations
+    // fn create_test_config(
+    //     start_byte: u8,
+    //     end_byte: u8,
+    //     start_iter: Option<&[u8]>,
+    //     end_iter: Option<&[u8]>,
+    //     ascending: bool,
+    // ) -> IteratorTestConfig {
+    //     IteratorTestConfig {
+    //         start_byte_to_set: start_byte,
+    //         end_byte_to_set: end_byte,
+    //         start_iterate: start_iter.map(|s| s.to_vec()),
+    //         end_iterate: end_iter.map(|e| e.to_vec()),
+    //         ascending,
+    //     }
+    // }
+
+    // #[test]
+    // fn test_iterator_nil_tree_failure() {
+    //     // This test simulates the Go test: TestIterator_NewIterator_NilTree_Failure
+    //     // Since our iterator requires an Arc<ImmutableTree>, we'll test error conditions
+    //     // by testing the domain and validity functions instead
+
+    //     let start = b"a";
+    //     let end = b"c";
+
+    //     // Since we can't create an iterator with nil tree in Rust due to type safety,
+    //     // we test that our mock can simulate this scenario
+    //     let mock_error = DBError::NilTreeGiven;
+    //     assert_eq!(format!("{}", mock_error), "nil tree given");
+    // }
+
+    // #[test]
+    // fn test_iterator_empty_invalid() {
+    //     // This test simulates: TestIterator_Empty_Invalid
+    //     let config = create_test_config(b'a', b'z', Some(b"a"), Some(b"a"), true);
+
+    //     // Test that our test config was created correctly
+    //     assert_eq!(config.start_byte_to_set, b'a');
+    //     assert_eq!(config.end_byte_to_set, b'z');
+    //     assert_eq!(config.start_iterate, Some(b"a".to_vec()));
+    //     assert_eq!(config.end_iterate, Some(b"a".to_vec()));
+    //     assert!(config.ascending);
+
+    //     // In a real implementation, this would test that an iterator with
+    //     // start == end would be invalid (empty range)
+    // }
+
+    // #[test]
+    // fn test_iterator_basic_ranged_ascending_success() {
+    //     // This test simulates: TestIterator_Basic_Ranged_Ascending_Success
+    //     let config = create_test_config(b'a', b'z', Some(b"e"), Some(b"w"), true);
+
+    //     assert_eq!(config.start_iterate, Some(b"e".to_vec()));
+    //     assert_eq!(config.end_iterate, Some(b"w".to_vec()));
+    //     assert!(config.ascending);
+
+    //     // Test data setup
+    //     let test_data = TestUtils::setup_test_data(&config);
+    //     assert!(!test_data.is_empty());
+
+    //     // Verify data is in expected range
+    //     for (key, _) in &test_data {
+    //         assert!(key[0] >= config.start_byte_to_set);
+    //         assert!(key[0] <= config.end_byte_to_set);
+    //     }
+    // }
+
+    // #[test]
+    // fn test_iterator_basic_ranged_descending_success() {
+    //     // This test simulates: TestIterator_Basic_Ranged_Descending_Success
+    //     let config = create_test_config(b'a', b'z', Some(b"e"), Some(b"w"), false);
+
+    //     assert_eq!(config.start_iterate, Some(b"e".to_vec()));
+    //     assert_eq!(config.end_iterate, Some(b"w".to_vec()));
+    //     assert!(!config.ascending); // descending
+
+    //     let test_data = TestUtils::setup_test_data(&config);
+    //     assert!(!test_data.is_empty());
+    // }
+
+    // #[test]
+    // fn test_iterator_basic_full_ascending_success() {
+    //     // This test simulates: TestIterator_Basic_Full_Ascending_Success
+    //     let config = create_test_config(b'a', b'z', None, None, true);
+
+    //     assert_eq!(config.start_iterate, None);
+    //     assert_eq!(config.end_iterate, None);
+    //     assert!(config.ascending);
+
+    //     let test_data = TestUtils::setup_test_data(&config);
+    //     assert!(!test_data.is_empty());
+    //     // Should include full range from 'a' to 'z'
+    //     assert_eq!(test_data.len(), (b'z' - b'a' + 1) as usize);
+    // }
+
+    // #[test]
+    // fn test_iterator_basic_full_descending_success() {
+    //     // This test simulates: TestIterator_Basic_Full_Descending_Success
+    //     let config = create_test_config(b'a', b'z', None, None, false);
+
+    //     assert_eq!(config.start_iterate, None);
+    //     assert_eq!(config.end_iterate, None);
+    //     assert!(!config.ascending); // descending
+
+    //     let test_data = TestUtils::setup_test_data(&config);
+    //     assert!(!test_data.is_empty());
+    //     assert_eq!(test_data.len(), (b'z' - b'a' + 1) as usize);
+    // }
+
+    // #[test]
+    // fn test_node_iterator_with_empty_root() {
+    //     // This test simulates: TestNodeIterator_WithEmptyRoot
+
+    //     // Test with nil root key (empty vec in Rust)
+    //     let empty_root: Vec<u8> = vec![];
+    //     assert!(empty_root.is_empty());
+
+    //     // Test with None equivalent (empty vec)
+    //     let nil_root: Vec<u8> = vec![];
+    //     assert!(nil_root.is_empty());
+
+    //     // In the actual implementation, both should result in invalid iterators
+    // }
+
+    // #[test]
+    // fn test_iterator_next_error_handling() {
+    //     // This test simulates: TestIterator_Next_ErrorHandling
+
+    //     // Test that we can create error scenarios
+    //     let db_error = crate::node_db::DBError::NodeKeyNotFound;
+    //     let iter_error = IteratorError::from(db_error);
+
+    //     match iter_error {
+    //         IteratorError::TraversalError(_) => {
+    //             // Expected - error was properly converted
+    //         }
+    //         _ => panic!("Expected TraversalError variant"),
+    //     }
+    // }
+
+    // #[test]
+    // fn test_delayed_nodes() {
+    //     let mut delayed = DelayedNodes::new();
+    //     assert_eq!(delayed.length(), 0);
+
+    //     let node = TestUtils::create_leaf_node("test", "value");
+    //     delayed.push(node.clone(), true);
+    //     assert_eq!(delayed.length(), 1);
+
+    //     let popped = delayed.pop().unwrap();
+    //     assert_eq!(delayed.length(), 0);
+    //     assert!(popped.1); // delayed flag should be true
+    // }
+
+    // #[test]
+    // fn test_delayed_nodes_operations() {
+    //     let mut delayed = DelayedNodes::new();
+
+    //     // Test empty state
+    //     assert_eq!(delayed.length(), 0);
+    //     assert!(delayed.pop().is_none());
+
+    //     // Test single push/pop
+    //     let node1 = TestUtils::create_leaf_node("key1", "value1");
+    //     delayed.push(node1, true);
+    //     assert_eq!(delayed.length(), 1);
+
+    //     let (_, delayed_flag) = delayed.pop().unwrap();
+    //     assert_eq!(delayed.length(), 0);
+    //     assert!(delayed_flag);
+
+    //     // Test multiple pushes - LIFO (stack behavior)
+    //     let node2 = TestUtils::create_leaf_node("key2", "value2");
+    //     let node3 = TestUtils::create_leaf_node("key3", "value3");
+
+    //     delayed.push(node2, false);
+    //     delayed.push(node3, true);
+    //     assert_eq!(delayed.length(), 2);
+
+    //     // Pop order should be LIFO
+    //     let (_, flag1) = delayed.pop().unwrap();
+    //     assert!(flag1); // Last pushed was delayed=true
+
+    //     let (_, flag2) = delayed.pop().unwrap();
+    //     assert!(!flag2); // First pushed was delayed=false
+
+    //     assert_eq!(delayed.length(), 0);
+    // }
+
+    // #[test]
+    // fn test_iterator_error_enum() {
+    //     // Test error enum variants
+    //     let db_err = crate::node_db::DBError::NodeKeyNotFound;
+    //     let iter_err = IteratorError::from(db_err);
+
+    //     match iter_err {
+    //         IteratorError::TraversalError(_) => {
+    //             // Expected conversion
+    //         }
+    //         _ => panic!("Expected TraversalError variant"),
+    //     }
+
+    //     let nil_err = IteratorError::NilTreeGiven;
+    //     match nil_err {
+    //         IteratorError::NilTreeGiven => {
+    //             // Expected variant
+    //         }
+    //         _ => panic!("Expected NilTreeGiven variant"),
+    //     }
+
+    //     // Test debug formatting
+    //     let debug_str = format!("{:?}", nil_err);
+    //     assert!(debug_str.contains("NilTreeGiven"));
+    // }
+
+    // #[test]
+    // fn test_mock_error_types() {
+    //     // Test our mock error types that simulate Go error conditions
+    //     let errors = vec![
+    //         MockError::NilTreeGiven,
+    //         MockError::NilNdbGiven,
+    //         MockError::NilAdditionsGiven,
+    //         MockError::NilRemovalsGiven,
+    //     ];
+
+    //     for error in errors {
+    //         let error_str = format!("{}", error);
+    //         let debug_str = format!("{:?}", error);
+
+    //         // Each error should have a non-empty string representation
+    //         assert!(!error_str.is_empty());
+    //         assert!(!debug_str.is_empty());
+    //     }
+    // }
+
+    // #[test]
+    // fn test_node_creation() {
+    //     // Test that we can create nodes for testing
+    //     let node = TestUtils::create_leaf_node("test_key", "test_value");
+    //     let node_read = node.read().unwrap();
+
+    //     assert_eq!(node_read.key, b"test_key");
+    //     assert_eq!(node_read.value, Some(b"test_value".to_vec()));
+    //     assert!(node_read.is_leaf());
+    //     assert_eq!(node_read.size.get(), 1);
+
+    //     // Test branch node creation
+    //     let left_child = TestUtils::create_leaf_node("left", "left_val");
+    //     let right_child = TestUtils::create_leaf_node("right", "right_val");
+
+    //     let branch = TestUtils::create_branch_node("branch", Some(left_child), Some(right_child));
+    //     let branch_read = branch.read().unwrap();
+
+    //     assert_eq!(branch_read.key, b"branch");
+    //     assert_eq!(branch_read.value, None); // Branch nodes don't have values
+    //     assert!(!branch_read.is_leaf()); // Should be a branch node
+    // }
+
+    // #[test]
+    // fn test_test_configurations() {
+    //     // Test that we can create various test configurations
+    //     let configs = TestUtils::create_test_configs();
+    //     assert!(!configs.is_empty());
+
+    //     // Verify we have different types of configurations
+    //     let has_ascending = configs.iter().any(|c| c.ascending);
+    //     let has_descending = configs.iter().any(|c| !c.ascending);
+    //     let has_range = configs.iter().any(|c| c.start_iterate.is_some());
+    //     let has_full = configs.iter().any(|c| c.start_iterate.is_none());
+
+    //     assert!(has_ascending);
+    //     assert!(has_descending);
+    //     assert!(has_range);
+    //     assert!(has_full);
+    // }
+
+    #[test]
+    fn test_iterator_with_random_tree() {
+        let tree = TestUtils::create_random_iavl_tree(10).unwrap();
+        let mut iter = Iterator::new(b"", b"", true, false, false, tree);
+        assert!(iter.valid());
+    }
+
+    #[test]
+    fn test_node_iterator_with_empty_root() {
+        let db = TestUtils::create_mock_db();
+        let ndb = Arc::new(NodeDB::new(db, 100).unwrap());
+
+        // empty root key
+        let node_iterator = NodeIterator::new(vec![], ndb.clone());
+        assert!(node_iterator.is_ok());
+        assert!(!node_iterator.unwrap().valid());
+
+        // empty root key
+        let node_iterator = NodeIterator::new(vec![1, 2, 3], ndb);
+        assert!(node_iterator.is_err());
+    }
+
+    #[test]
+    fn test_iterator_next_error_handling() {
+        let tree = TestUtils::create_mock_tree_with_root().unwrap();
+
+        let left = TestUtils::create_leaf_node("5", "left_value", 1, 2);
+
+        tree.root.write().unwrap().left_node_key =
+            Some(left.read().unwrap().node_key.clone().unwrap());
+        tree.root.write().unwrap().right_node = Some(left);
+
+        tree.root.write().unwrap().size = U63::new(1).unwrap();
+        tree.root.write().unwrap().subtree_height = U7::new(2).unwrap();
+        tree.root.write().unwrap().value = None;
+
+        let mut iter = Iterator::new(b"", b"", true, false, false, tree);
+
+        iter.next();
+
+        assert!(!iter.valid());
     }
 }

@@ -66,30 +66,18 @@ pub type U31 = BoundedUint<u32, i32>;
 pub type U63 = BoundedUint<u64, i64>;
 
 impl U7 {
-    pub fn new(x: u8) -> Result<Self, BoundedUintError> {
-        BoundedUint::<u8, i8>::new(x)
-    }
-
     pub fn zero() -> Self {
         BoundedUint::<u8, i8>::new(0).unwrap()
     }
 }
 
 impl U31 {
-    pub fn new(x: u32) -> Result<Self, BoundedUintError> {
-        BoundedUint::<u32, i32>::new(x)
-    }
-
     pub fn zero() -> Self {
         BoundedUint::<u32, i32>::new(0).unwrap()
     }
 }
 
 impl U63 {
-    pub fn new(x: u64) -> Result<Self, BoundedUintError> {
-        BoundedUint::<u64, i64>::new(x)
-    }
-
     pub fn zero() -> Self {
         BoundedUint::<u64, i64>::new(0).unwrap()
     }

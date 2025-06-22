@@ -1,3 +1,4 @@
+use proof::PathToLeaf;
 use std::{
     cmp::Ordering,
     sync::{Arc, Mutex, PoisonError, RwLock},
@@ -22,7 +23,12 @@ mod immutable_tree;
 pub mod iterator;
 mod key_format;
 mod node_db;
-mod types;
+pub mod proof;
+pub mod proof_ics23;
+#[cfg(test)]
+pub mod test_util;
+
+pub mod types;
 
 // NodeKey represents a key of node in the DB
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -67,6 +73,9 @@ pub enum NodeError {
 
     #[error("other error")]
     Poison,
+
+    #[error("proof error")]
+    ProofError(#[from] proof::ProofError),
 }
 
 impl<T> From<PoisonError<T>> for NodeError {
@@ -605,6 +614,109 @@ impl Node {
             }
         }
         Ok(stop)
+    }
+
+    /// PathToLeaf returns the path from this node to a leaf containing the given key
+    /// If the key does not exist, returns the path to the next leaf left of key (w/ path),
+    /// except when key is less than the least item, in which case it returns a path to the least item.
+    pub fn path_to_leaf<DB: KVStoreWithBatch>(
+        &self,
+        tree: &ImmutableTree<DB>,
+        key: &[u8],
+        version: crate::types::U63,
+    ) -> Result<(PathToLeaf, Option<Arc<RwLock<Node>>>), NodeError> {
+        let mut path = PathToLeaf { path: Vec::new() };
+        let leaf_node = self.path_to_leaf_recursive(tree, key, version, &mut path)?;
+        Ok((path, leaf_node))
+    }
+
+    /// path_to_leaf_recursive is a helper which recursively constructs the PathToLeaf.
+    /// As an optimization the already constructed path is passed in as an argument
+    /// and is shared among recursive calls.
+    fn path_to_leaf_recursive<DB: KVStoreWithBatch>(
+        &self,
+        tree: &ImmutableTree<DB>,
+        key: &[u8],
+        version: U63,
+        path: &mut PathToLeaf,
+    ) -> Result<Option<Arc<RwLock<Node>>>, NodeError> {
+        // If this is a leaf node
+        if self.is_leaf() {
+            if self.key == key {
+                return Ok(Some(Arc::new(RwLock::new(self.clone()))));
+            }
+            return Err(NodeError::DeserializationError("key does not exist".into()));
+        }
+
+        // Determine the version to use for this node
+        let node_version = if let Some(ref node_key) = self.node_key {
+            node_key.version
+        } else {
+            version
+        };
+
+        // Note that we do not store the left child in the ProofInnerNode when we're going to add the
+        // left node as part of the path, similarly we don't store the right child info when going down
+        // the right child node. This is done as an optimization since the child info is going to be
+        // already stored in the next ProofInnerNode in PathToLeaf.
+
+        if key < self.key.as_slice() {
+            // left side - we store the right node hash since we're going left
+            let right_node = self
+                .get_right_node(tree)
+                .ok_or_else(|| NodeError::DeserializationError("right node not found".into()))?;
+
+            let right_hash = {
+                let right_node_guard = right_node.read()?;
+                right_node_guard.hash.clone()
+            };
+
+            let pin = crate::proof::ProofInnerNode::new(
+                self.subtree_height,
+                self.size,
+                node_version,
+                None,             // Left is None since we're going left
+                Some(right_hash), // Right contains the right node's hash
+            )
+            .map_err(|e| NodeError::ProofError(e))?;
+
+            path.path.push(pin);
+
+            let left_node = self
+                .get_left_node(tree)
+                .ok_or_else(|| NodeError::DeserializationError("left node not found".into()))?;
+
+            let left_node_guard = left_node.read()?;
+            return left_node_guard.path_to_leaf_recursive(tree, key, version, path);
+        }
+
+        // right side - we store the left node hash since we're going right
+        let left_node = self
+            .get_left_node(tree)
+            .ok_or_else(|| NodeError::DeserializationError("left node not found".into()))?;
+
+        let left_hash = {
+            let left_node_guard = left_node.read()?;
+            left_node_guard.hash.clone()
+        };
+
+        let pin = crate::proof::ProofInnerNode::new(
+            self.subtree_height,
+            self.size,
+            node_version,
+            Some(left_hash), // Left contains the left node's hash
+            None,            // Right is None since we're going right
+        )
+        .map_err(|e| NodeError::ProofError(e))?;
+
+        path.path.push(pin);
+
+        let right_node = self
+            .get_right_node(tree)
+            .ok_or_else(|| NodeError::DeserializationError("right node not found".into()))?;
+
+        let right_node_guard = right_node.read()?;
+        right_node_guard.path_to_leaf_recursive(tree, key, version, path)
     }
 }
 

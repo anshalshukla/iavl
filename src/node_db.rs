@@ -7,7 +7,7 @@ use crate::{Node, NodeKey};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::error::Error;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::{i64, u8};
 
 mod keys;
@@ -74,7 +74,7 @@ pub trait BatchCreator {
     fn new_batch_with_size(&self) -> Box<dyn Batch<Error = DBError>>;
 }
 
-#[derive(thiserror::Error, Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum DBError {
     #[error("iterator error")]
     IteratorError,
@@ -101,6 +101,12 @@ pub enum DBError {
     #[error("invalid root key: {0}")]
     InvalidRootKey(String),
 
+    #[error("invalid node key: {0}")]
+    InvalidNodeKey(String),
+
+    #[error("deserialization error: {0}")]
+    DeserializationError(String),
+
     #[error("nil value")]
     NilValue,
 
@@ -112,11 +118,17 @@ pub enum DBError {
 
     #[error("node key not found")]
     NodeKeyNotFound,
+
+    #[error("error: {0}")]
+    Other(String),
+
+    #[error("poisoned")]
+    PoisonedError,
 }
 
-impl<E: Error> From<E> for DBError {
-    fn from(err: E) -> Self {
-        DBError::BatchError(err.to_string())
+impl<T> From<PoisonError<T>> for DBError {
+    fn from(_: PoisonError<T>) -> Self {
+        DBError::PoisonedError
     }
 }
 
@@ -138,7 +150,7 @@ impl<DB> NodeDB<DB>
 where
     DB: KVStoreWithBatch,
 {
-    fn new(db: DB, cache_size: u64) -> Result<Self, DBError> {
+    pub fn new(db: DB, cache_size: u64) -> Result<Self, DBError> {
         // let key = MetadataKeyFormat::new(STORAGE_VERSION_KEY.as_bytes()).key_bytes();
         // let store_version = db.get(key).unwrap();
 
@@ -176,13 +188,17 @@ where
     // load its childern
     // `kf`: <version><none>
     pub fn get_node(&self, kf: Vec<u8>) -> Result<Arc<RwLock<Node>>, DBError> {
-        let (version, nonce) = NodeKeyFormat::extract_version_nonce(&kf).unwrap();
+        let (version, nonce) = NodeKeyFormat::extract_version_nonce(&kf).ok_or(
+            DBError::InvalidNodeKey(format!("invalid node key: {:?}", kf)),
+        )?;
         let node_key = NodeKey { version, nonce };
         let node_key = node_key.serialize();
 
         // Check the cache
         if let Some(node) = self.cache.get(&kf) {
-            let node = Node::deserialize(&node_key, &node).unwrap();
+            let node = Node::deserialize(&node_key, &node).map_err(|e| {
+                DBError::DeserializationError(format!("deserialization error: {:?}", e))
+            })?;
             return Ok(Arc::new(RwLock::new(*node)));
         }
 
@@ -228,7 +244,11 @@ where
 
         let buf = node.serialize();
 
-        self.batch.as_ref().unwrap().set(node.get_key(), buf)?;
+        self.batch
+            .as_ref()
+            .unwrap()
+            .set(node.get_key(), buf)
+            .map_err(|e| DBError::BatchError(e.to_string()))?;
 
         Ok(())
     }
@@ -243,7 +263,12 @@ where
         if self.db.is_none() {
             return Err(DBError::DBNotFound);
         }
-        let has = self.db.as_ref().unwrap().has(nk)?;
+        let has = self
+            .db
+            .as_ref()
+            .unwrap()
+            .has(nk)
+            .map_err(|e| DBError::Other(e.to_string()))?;
         Ok(has)
     }
 
@@ -284,8 +309,10 @@ where
     // hasVersion checks if the given version exists.
     fn has_version(&self, version: U63) -> Result<bool, DBError> {
         let root_key = NodeKey::get_root_key(version);
-        let key = NodeKeyFormat::new(root_key, 0);
-        let has = self.has(key.key_bytes())?;
+        let key = NodeKeyFormat::from_key_bytes(&root_key).ok_or(DBError::InvalidRootKey(
+            format!("invalid root key: {:?}", root_key),
+        ))?;
+        let has = self.has(key)?;
         Ok(has)
     }
 
@@ -311,8 +338,14 @@ where
     // SaveEmptyRoot saves the empty root.
     fn save_empty_root(&self, version: U63) -> Result<(), DBError> {
         let root_key = NodeKey::get_root_key(version);
-        let key = NodeKeyFormat::new(root_key, 0);
-        self.batch.as_ref().unwrap().set(key.key_bytes(), vec![])?;
+        let key = NodeKeyFormat::from_key_bytes(&root_key).ok_or(DBError::InvalidRootKey(
+            format!("invalid root key: {:?}", root_key),
+        ))?;
+        self.batch
+            .as_ref()
+            .unwrap()
+            .set(key, vec![])
+            .map_err(|e| DBError::Other(e.to_string()))?;
         Ok(())
     }
 
@@ -348,7 +381,12 @@ where
             return Err(DBError::NodeDBError);
         }
 
-        let val = self.db.as_ref().unwrap().get(key.unwrap())?;
+        let val = self
+            .db
+            .as_ref()
+            .unwrap()
+            .get(key.unwrap())
+            .map_err(|e| DBError::Other(e.to_string()))?;
 
         if val.is_none() {
             return Err(DBError::NodeDBError);
@@ -358,13 +396,18 @@ where
             return Ok(val.unwrap());
         }
 
-        let (is_ref, n) = is_reference_root(&val.unwrap());
+        let (is_ref, n) = is_reference_root(val.as_ref().unwrap());
         if is_ref {
             // point to the prev version
             match n {
                 NodeKeyFormat::LENGTH => {
-                    let nk = NodeKey::get_node_key(&val.unwrap()[1..]);
-                    let val = self.db.as_ref().unwrap().get(val.unwrap())?;
+                    let nk = NodeKey::get_node_key(&val.clone().unwrap()[1..]);
+                    let val = self
+                        .db
+                        .as_ref()
+                        .unwrap()
+                        .get(val.clone().unwrap())
+                        .map_err(|e| DBError::Other(e.to_string()))?;
 
                     if nk.is_none() {
                         return Err(DBError::NilKey);
@@ -383,7 +426,12 @@ where
                             return Err(DBError::NilKey);
                         }
 
-                        let val = self.db.as_ref().unwrap().get(rnk_key.unwrap())?;
+                        let val = self
+                            .db
+                            .as_ref()
+                            .unwrap()
+                            .get(rnk_key.unwrap())
+                            .map_err(|e| DBError::Other(e.to_string()))?;
 
                         if val.is_none() {
                             return Err(DBError::VersionDoesNotExist);
@@ -429,11 +477,11 @@ impl RootKeyCache {
 
     pub fn get_root_key<DB: KVStoreWithBatch>(
         &mut self,
-        version: i64,
+        version: U63,
         ndb: &NodeDB<DB>,
     ) -> Result<Vec<u8>, String> {
         for i in 0..2 {
-            if self.versions[i] == version {
+            if self.versions[i] == version.as_signed() {
                 if let Some(ref key) = self.root_keys[i] {
                     return Ok(key.clone());
                 }
@@ -445,8 +493,8 @@ impl RootKeyCache {
         Ok(root_key)
     }
 
-    fn set_root_key(&mut self, version: i64, root_key: Vec<u8>) {
-        self.versions[self.next] = version;
+    fn set_root_key(&mut self, version: U63, root_key: Vec<u8>) {
+        self.versions[self.next] = version.as_signed();
         self.root_keys[self.next] = Some(root_key);
         self.next = (self.next + 1) % 2;
     }
@@ -457,226 +505,4 @@ fn is_reference_root(bz: &[u8]) -> (bool, usize) {
         return (true, bz.len());
     }
     (false, 0)
-}
-
-pub struct NodeIterator<DB>
-where
-    DB: KVStoreWithBatch,
-{
-    nodes_to_visit: Vec<Arc<Node>>,
-    node_db: Arc<NodeDB<DB>>,
-    err: Option<DBError>,
-}
-
-impl<DB> NodeIterator<DB>
-where
-    DB: KVStoreWithBatch,
-{
-    pub fn new(root_key: Vec<u8>, ndb: Arc<NodeDB<DB>>) -> Result<Self, DBError> {
-        let mut nodes_to_visit = Vec::new();
-
-        if root_key.is_empty() {
-            // If root key is empty, return iterator with empty array
-            return Ok(NodeIterator {
-                nodes_to_visit,
-                node_db: ndb,
-                err: None,
-            });
-        }
-
-        // Get the node for the root key
-        let node = ndb.get_node(root_key)?;
-
-        // Put it in the array
-        nodes_to_visit.push(node);
-
-        Ok(NodeIterator {
-            nodes_to_visit,
-            node_db: ndb,
-            err: None,
-        })
-    }
-
-    pub fn get_node(&self) -> Option<Arc<Node>> {
-        self.nodes_to_visit.last().cloned()
-    }
-
-    pub fn next(&mut self, skip_child: bool) {
-        if self.nodes_to_visit.is_empty() {
-            return;
-        }
-
-        let current = self.nodes_to_visit.pop().unwrap();
-
-        if !skip_child {
-            // Add right child first (so it's processed last - stack behavior)
-            if let Some(right_key) = &current.right_node_key {
-                match self.node_db.get_node(right_key.to_vec()) {
-                    Ok(node) => self.nodes_to_visit.push(node),
-                    Err(e) => self.err = Some(e),
-                }
-            }
-
-            // Add left child
-            if let Some(left_key) = &current.left_node_key {
-                match self.node_db.get_node(left_key.to_vec()) {
-                    Ok(node) => self.nodes_to_visit.push(node),
-                    Err(e) => self.err = Some(e),
-                }
-            }
-        }
-    }
-
-    pub fn valid(&self) -> bool {
-        !self.nodes_to_visit.is_empty() && self.err.is_none()
-    }
-
-    pub fn error(&self) -> Option<&DBError> {
-        self.err.as_ref()
-    }
-}
-
-#[derive(Clone)]
-struct DelayedNode {
-    node: Arc<Node>,
-    delayed: bool,
-}
-
-#[derive(Default)]
-struct DelayedNodes {
-    nodes: Vec<DelayedNode>,
-}
-
-impl DelayedNodes {
-    pub fn new() -> Self {
-        Self { nodes: Vec::new() }
-    }
-
-    pub fn pop(&mut self) -> Option<(Arc<Node>, bool)> {
-        self.nodes.pop().map(|node| (node.node, node.delayed))
-    }
-
-    pub fn push(&mut self, node: Arc<Node>, delayed: bool) {
-        self.nodes.push(DelayedNode { node, delayed });
-    }
-
-    pub fn length(&self) -> usize {
-        self.nodes.len()
-    }
-}
-
-#[derive(Clone)]
-pub struct Traversal {
-    tree: Arc<ImmutableTree>,    // Using Arc for shared ownership
-    start: Vec<u8>,              // iteration domain start
-    end: Vec<u8>,                // iteration domain end
-    ascending: bool,             // ascending traversal
-    inclusive: bool,             // end key inclusiveness
-    post: bool,                  // postorder traversal
-    delayed_nodes: DelayedNodes, // delayed nodes to be traversed
-}
-
-#[derive(Error, Debug)]
-#[error("iterator must be created with an immutable tree but the tree was nil")]
-pub struct IteratorNilTreeError;
-
-impl Node {
-    pub fn new_traversal(
-        tree: Arc<ImmutableTree>,
-        start: Vec<u8>,
-        end: Vec<u8>,
-        ascending: bool,
-        inclusive: bool,
-        post: bool,
-    ) -> Result<Traversal, IteratorNilTreeError> {
-        if tree.is_nil() {
-            return Err(IteratorNilTreeError);
-        }
-
-        let mut delayed_nodes = DelayedNodes::new();
-        delayed_nodes.push(Arc::new(self.clone()), true); // set initial traverse to the node
-
-        Ok(Traversal {
-            tree,
-            start,
-            end,
-            ascending,
-            inclusive,
-            post,
-            delayed_nodes,
-        })
-    }
-}
-
-impl Traversal {
-    pub fn next(&mut self) -> Result<Option<Arc<Node>>, DBError> {
-        // End of traversal
-        if self.delayed_nodes.length() == 0 {
-            return Ok(None);
-        }
-
-        // Get next node to process
-        let (node, delayed) = self.delayed_nodes.pop().ok_or(DBError::NodeDBError)?;
-
-        // Already expanded, immediately return
-        if !delayed {
-            return Ok(Some(node));
-        }
-
-        // Check if node is within bounds
-        let after_start = self.start.is_empty() || self.start.as_slice() < node.key.as_slice();
-        let start_or_after = after_start || self.start.as_slice() == node.key.as_slice();
-        let before_end = self.end.is_empty() || node.key.as_slice() < self.end.as_slice();
-        let before_end = if self.inclusive {
-            before_end || node.key.as_slice() == self.end.as_slice()
-        } else {
-            before_end
-        };
-
-        // Case of postorder (A-1 and B-1)
-        // Recursively process left sub-tree, then right-subtree, then node itself
-        if self.post && (!node.is_leaf() || (start_or_after && before_end)) {
-            self.delayed_nodes.push(node.clone(), false);
-        }
-
-        // Case of branch node, traversing children (A-2)
-        if !node.is_leaf() {
-            if self.ascending {
-                // Ascending: traverse left subtree first, then right
-                if before_end {
-                    // Push right node for later traversal
-                    if let Some(right_node) = node.get_right_node(&self.tree)? {
-                        self.delayed_nodes.push(right_node, true);
-                    }
-                }
-                if after_start {
-                    // Push left node for immediate traversal
-                    if let Some(left_node) = node.get_left_node(&self.tree)? {
-                        self.delayed_nodes.push(left_node, true);
-                    }
-                }
-            } else {
-                // Descending: traverse right subtree first, then left
-                if after_start {
-                    if let Some(left_node) = node.get_left_node(&self.tree)? {
-                        self.delayed_nodes.push(left_node, true);
-                    }
-                }
-                if before_end {
-                    if let Some(right_node) = node.get_right_node(&self.tree)? {
-                        self.delayed_nodes.push(right_node, true);
-                    }
-                }
-            }
-        }
-
-        // Case of preorder traversal (A-3 and B-2)
-        // Process root then recursively process left child, then right child
-        if !self.post && (!node.is_leaf() || (start_or_after && before_end)) {
-            return Ok(Some(node));
-        }
-
-        // Keep traversing and expanding remaining delayed nodes (A-4)
-        self.next()
-    }
 }
