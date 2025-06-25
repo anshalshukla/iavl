@@ -4,17 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-mini-moka = "0.10.3"
-prost = "0.13.5"
-redb = "2.6.0"
-sha2 = "0.10.9"
-thiserror = "2.0.12"
-zigzag = "0.1.0"
-byteorder = "1.5"
-rocksdb = "0.21"  
-
+bon = "3.5"
+bytes = "1.10"
+integer-encoding = "4"
+sha2 = "0.10"
+thiserror = "2"
 
 [dev-dependencies]
-hex = "0.4.3"
-rand = "0.9.1"
+const-hex = "1"
+rand = "0.9"
 rstest = "0.25"

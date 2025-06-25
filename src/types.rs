@@ -1,118 +1,94 @@
-use std::{cmp::Ordering, ops::Sub};
+use bytes::Bytes;
 
-use thiserror::Error;
+macro_rules! define_ux {
+    ($name:ident, $unsigned:ty, $signed:ty) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        pub struct $name($unsigned);
 
-#[derive(Debug, Clone, PartialEq, Eq, Copy)]
-pub struct BoundedUint<U, I> {
-    value: U,
-    _phantom: std::marker::PhantomData<I>,
-}
+        impl $name {
+            pub const MIN: Self = Self(<$unsigned>::MIN);
+            pub const MAX: Self = Self(Self::INNER_MAX);
+            pub const ONE: Self = Self(1);
+            pub const TWO: Self = Self(2);
 
-pub trait BoundedUintTrait<U, I> {
-    fn new(x: U) -> Result<BoundedUint<U, I>, BoundedUintError>;
-    fn as_signed(&self) -> I;
-    fn to_be_bytes(&self) -> Vec<u8>;
-    fn cmp(&self, x: BoundedUint<U, I>) -> Ordering;
-    fn get(&self) -> U;
-}
+            const INNER_MAX: $unsigned = <$signed>::MAX as $unsigned;
 
-#[derive(Error, Debug)]
-pub enum BoundedUintError {
-    #[error("unsigned int exceeds the value of signed integer")]
-    ExceedsSignedInteger,
-}
-
-macro_rules! impl_bounded_uint {
-    ($u:ty, $i:ty) => {
-        impl BoundedUintTrait<$u, $i> for BoundedUint<$u, $i> {
-            fn new(x: $u) -> Result<Self, BoundedUintError> {
-                if x > <$i>::MAX as $u {
-                    return Err(BoundedUintError::ExceedsSignedInteger);
+            pub const fn new(x: $unsigned) -> Option<Self> {
+                if x <= Self::INNER_MAX {
+                    Some(Self(x))
+                } else {
+                    None
                 }
-                Ok(BoundedUint {
-                    value: x,
-                    _phantom: std::marker::PhantomData,
-                })
             }
 
-            fn as_signed(&self) -> $i {
-                self.value as $i
+            pub const fn from_signed(x: $signed) -> Option<Self> {
+                if x < 0 {
+                    None
+                } else {
+                    Self::new(x as $unsigned)
+                }
             }
 
-            fn to_be_bytes(&self) -> Vec<u8> {
-                self.value.to_be_bytes().to_vec()
+            pub const fn get(self) -> $unsigned {
+                self.0
             }
 
-            fn cmp(&self, x: BoundedUint<$u, $i>) -> Ordering {
-                self.value.cmp(&x.value)
-            }
-
-            fn get(&self) -> $u {
-                self.value
+            pub const fn to_signed(self) -> $signed {
+                self.get() as $signed
             }
         }
     };
 }
 
-impl_bounded_uint!(u8, i8);
-impl_bounded_uint!(u32, i32);
-impl_bounded_uint!(u64, i64);
+define_ux!(U7, u8, i8);
+define_ux!(U31, u32, i32);
+define_ux!(U63, u64, i64);
 
-// Type aliases for convenience
-// Specially designed data structures to enfore compile time check on fields like (subtree_height, version, nonce)
-// which are meant to be uint but are take int just to enable zigzag encoding
-pub type U7 = BoundedUint<u8, i8>;
-pub type U31 = BoundedUint<u32, i32>;
-pub type U63 = BoundedUint<u64, i64>;
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NonEmptyBz<T = Bytes>(T);
 
-impl U7 {
-    pub fn new(x: u8) -> Result<Self, BoundedUintError> {
-        BoundedUint::<u8, i8>::new(x)
+impl<T> NonEmptyBz<T> {
+    /// If 'bz' is `[u8; N]` or `&[u8; N]`, consider using `NonEmptyBz::from_#_array()` constructors
+    pub fn new(bz: T) -> Option<Self>
+    where
+        T: AsRef<[u8]>,
+    {
+        (!bz.as_ref().is_empty()).then_some(Self(bz))
     }
 
-    pub fn zero() -> Self {
-        BoundedUint::<u8, i8>::new(0).unwrap()
-    }
-}
-
-impl U31 {
-    pub fn new(x: u32) -> Result<Self, BoundedUintError> {
-        BoundedUint::<u32, i32>::new(x)
+    pub const fn get(&self) -> &T {
+        &self.0
     }
 
-    pub fn zero() -> Self {
-        BoundedUint::<u32, i32>::new(0).unwrap()
-    }
-}
-
-impl U63 {
-    pub fn new(x: u64) -> Result<Self, BoundedUintError> {
-        BoundedUint::<u64, i64>::new(x)
+    pub fn len(&self) -> usize
+    where
+        T: AsRef<[u8]>,
+    {
+        self.0.as_ref().len()
     }
 
-    pub fn zero() -> Self {
-        BoundedUint::<u64, i64>::new(0).unwrap()
+    pub fn is_empty(&self) -> bool
+    where
+        T: AsRef<[u8]>,
+    {
+        self.0.as_ref().is_empty()
+    }
+
+    pub fn into_inner(self) -> T {
+        self.0
     }
 }
 
-impl Sub<U63> for U63 {
-    type Output = i64;
+impl<const N: usize> NonEmptyBz<[u8; N]> {
+    pub const fn from_owned_array(bz: [u8; N]) -> Self {
+        const { assert!(N != 0) }
+        Self(bz)
+    }
+}
 
-    fn sub(self, other: Self) -> Self::Output {
-        // Secure subtraction with overflow checking
-        // Since U63 guarantees values are <= i64::MAX, we can safely convert to i64
-        let left = self.value as i64;
-        let right = other.value as i64;
-
-        // Use checked_sub to detect overflow
-        match left.checked_sub(right) {
-            Some(result) => result,
-            None => {
-                // Handle overflow - in this case, the result would be less than i64::MIN
-                // Since we're subtracting unsigned values that fit in i64, this should be rare
-                // but we'll return i64::MIN as a saturated result
-                i64::MIN
-            }
-        }
+impl<'a, const N: usize> NonEmptyBz<&'a [u8; N]> {
+    pub const fn from_borrowed_array(bz: &'a [u8; N]) -> Self {
+        const { assert!(N != 0) }
+        Self(bz)
     }
 }
