@@ -177,14 +177,18 @@ impl TestUtils {
     /// Create a mock immutable tree for testing
     pub fn create_mock_tree_with_root() -> Result<Arc<ImmutableTree<MockDB>>, DBError> {
         let db = MockDB::new();
+        let ndb = Arc::new(NodeDB::new(db, Self::CACHE_SIZE).unwrap());
 
         println!("reached here");
 
-        let root = Self::create_leaf_node("6", "root_value", 1, 1);
-        let root_node_key = root.read().unwrap().node_key.clone().unwrap().serialize();
-        db.insert(root_node_key, root.read().unwrap().serialize().unwrap());
+        let root = Self::create_leaf_node(6, "root_value", 1, 1);
 
-        let ndb = Arc::new(NodeDB::new(db, Self::CACHE_SIZE).unwrap());
+        // Save using NodeDB's save_node method
+        let node_copy = {
+            let node_guard = root.read().unwrap();
+            Box::new(node_guard.clone())
+        };
+        ndb.save_node(node_copy)?;
 
         let tree = ImmutableTree::new(root, ndb, U63::new(1).unwrap(), false);
         Ok(Arc::new(tree))
@@ -194,30 +198,42 @@ impl TestUtils {
     pub fn create_mock_tree_with_root_and_children() -> Result<Arc<ImmutableTree<MockDB>>, DBError>
     {
         let db = MockDB::new();
-
-        let left = Self::create_leaf_node("5", "left_value", 1, 2);
-        let left_node_key = left.read().unwrap().node_key.clone().unwrap().serialize();
-        db.insert(left_node_key, left.read().unwrap().serialize().unwrap());
-
-        let right = Self::create_leaf_node("7", "right_value", 1, 3);
-        let right_node_key = right.read().unwrap().node_key.clone().unwrap().serialize();
-        db.insert(right_node_key, right.read().unwrap().serialize().unwrap());
-
-        let root = Self::create_branch_node("6", Some(left), Some(right), 1, 1);
-        let root_node_key = root.read().unwrap().node_key.clone().unwrap().serialize();
-        db.insert(root_node_key, root.read().unwrap().serialize().unwrap());
-
         let ndb = Arc::new(NodeDB::new(db, Self::CACHE_SIZE).unwrap());
+
+        let left = Self::create_leaf_node(5, "left_value", 1, 2);
+        // Save left child using NodeDB's save_node method
+        let left_copy = {
+            let node_guard = left.read().unwrap();
+            Box::new(node_guard.clone())
+        };
+        ndb.save_node(left_copy)?;
+
+        let right = Self::create_leaf_node(7, "right_value", 1, 3);
+        // Save right child using NodeDB's save_node method
+        let right_copy = {
+            let node_guard = right.read().unwrap();
+            Box::new(node_guard.clone())
+        };
+        ndb.save_node(right_copy)?;
+
+        let root = Self::create_branch_node(6, Some(left), Some(right), 1, 1);
+        // Save root using NodeDB's save_node method
+        let root_copy = {
+            let node_guard = root.read().unwrap();
+            Box::new(node_guard.clone())
+        };
+        ndb.save_node(root_copy)?;
+
         let tree = ImmutableTree::new(root, ndb, U63::new(1).unwrap(), false);
         Ok(Arc::new(tree))
     }
 
     /// Create a leaf node for testing
-    pub fn create_leaf_node(key: &str, value: &str, version: u64, nonce: u32) -> Arc<RwLock<Node>> {
+    pub fn create_leaf_node(key: u32, value: &str, version: u64, nonce: u32) -> Arc<RwLock<Node>> {
         let node = Node {
-            key: key.as_bytes().to_vec(),
+            key: key.to_be_bytes().to_vec(),
             value: Some(value.as_bytes().to_vec()),
-            hash: vec![0; 32], // placeholder hash
+            hash: Vec::with_capacity(32), // placeholder hash
             node_key: Some(Box::new(NodeKey {
                 version: U63::new(version).unwrap(),
                 nonce: U31::new(nonce).unwrap(),
@@ -234,23 +250,29 @@ impl TestUtils {
 
     /// Create a branch node for testing
     pub fn create_branch_node(
-        key: &str,
+        key: u32,
         left_child: Option<Arc<RwLock<Node>>>,
         right_child: Option<Arc<RwLock<Node>>>,
         version: u64,
         nonce: u32,
     ) -> Arc<RwLock<Node>> {
         let node = Node {
-            key: key.as_bytes().to_vec(),
+            key: key.to_be_bytes().to_vec(),
             value: None,       // Branch nodes typically don't have values
             hash: vec![0; 32], // placeholder hash
             node_key: Some(Box::new(NodeKey {
                 version: U63::new(version).unwrap(),
                 nonce: U31::new(nonce).unwrap(),
             })),
-            left_node_key: None,        // Would be set based on children
-            right_node_key: None,       // Would be set based on children
-            size: U63::new(3).unwrap(), // Placeholder size
+            left_node_key: left_child.clone().unwrap().read().unwrap().node_key.clone(),
+            right_node_key: right_child
+                .clone()
+                .unwrap()
+                .read()
+                .unwrap()
+                .node_key
+                .clone(),
+            size: U63::new(2).unwrap(), // Placeholder size
             left_node: left_child,
             right_node: right_child,
             subtree_height: U7::new(1).unwrap(),
@@ -268,6 +290,7 @@ impl TestUtils {
         }
 
         let db = MockDB::new();
+        let ndb = Arc::new(NodeDB::new(db, Self::CACHE_SIZE)?);
         let mut rng = rand::thread_rng();
         let mut nonce_counter = 1u32;
 
@@ -282,11 +305,10 @@ impl TestUtils {
             1000,      // root version (large version space)
             &mut nonce_counter,
             &mut rng,
-            &db,
+            &ndb,
         )?;
 
-        let ndb = Arc::new(NodeDB::new(db, Self::CACHE_SIZE)?);
-        let tree = ImmutableTree::new(root, ndb, U63::new(1000).unwrap(), false);
+        let tree = ImmutableTree::new(root, ndb, U63::new(1000).unwrap(), true);
         Ok(Arc::new(tree))
     }
 
@@ -298,7 +320,7 @@ impl TestUtils {
         max_version: u64,
         nonce_counter: &mut u32,
         rng: &mut impl Rng,
-        db: &MockDB,
+        ndb: &Arc<NodeDB<MockDB>>,
     ) -> Result<Arc<RwLock<Node>>, DBError> {
         if height == 0 {
             // Create leaf node
@@ -315,16 +337,15 @@ impl TestUtils {
             let nonce = *nonce_counter;
             *nonce_counter += 1;
 
-            let node = Self::create_leaf_node(
-                &key_val.to_string(),
-                &format!("value_{}", key_val),
-                version,
-                nonce,
-            );
+            let node =
+                Self::create_leaf_node(key_val, &format!("value_{}", key_val), version, nonce);
 
-            // Store in database
-            let node_key = node.read().unwrap().node_key.clone().unwrap().serialize();
-            db.insert(node_key, node.read().unwrap().serialize().unwrap());
+            // Save using NodeDB's save_node method
+            let node_copy = {
+                let node_guard = node.read().unwrap();
+                Box::new(node_guard.clone())
+            };
+            ndb.save_node(node_copy)?;
 
             return Ok(node);
         }
@@ -350,7 +371,7 @@ impl TestUtils {
                 branch_version,
                 nonce_counter,
                 rng,
-                db,
+                ndb,
             )?;
 
             let right_child = Self::generate_random_subtree(
@@ -360,11 +381,11 @@ impl TestUtils {
                 branch_version,
                 nonce_counter,
                 rng,
-                db,
+                ndb,
             )?;
 
             let branch_node = Self::create_branch_node(
-                &branch_key.to_string(),
+                branch_key,
                 Some(left_child.clone()),
                 Some(right_child.clone()),
                 branch_version,
@@ -377,8 +398,8 @@ impl TestUtils {
                 &Some(left_child),
                 &Some(right_child),
                 height,
-                db,
-            );
+                ndb,
+            )?;
 
             return Ok(branch_node);
         }
@@ -405,7 +426,7 @@ impl TestUtils {
             branch_version,
             nonce_counter,
             rng,
-            db,
+            ndb,
         )?);
 
         // Generate right subtree (keys >= branch_key)
@@ -416,12 +437,12 @@ impl TestUtils {
             branch_version,
             nonce_counter,
             rng,
-            db,
+            ndb,
         )?);
 
         // Create the branch node
         let branch_node = Self::create_branch_node(
-            &branch_key.to_string(),
+            branch_key,
             left_child.clone(),
             right_child.clone(),
             branch_version,
@@ -429,7 +450,7 @@ impl TestUtils {
         );
 
         // Finalize the branch node with proper structure
-        Self::finalize_branch_node(&branch_node, &left_child, &right_child, height, db);
+        Self::finalize_branch_node(&branch_node, &left_child, &right_child, height, ndb)?;
 
         Ok(branch_node)
     }
@@ -440,8 +461,8 @@ impl TestUtils {
         left_child: &Option<Arc<RwLock<Node>>>,
         right_child: &Option<Arc<RwLock<Node>>>,
         height: u8,
-        db: &MockDB,
-    ) {
+        ndb: &Arc<NodeDB<MockDB>>,
+    ) -> Result<(), DBError> {
         // Set the node keys for children and calculate size
         {
             let mut branch_guard = branch_node.write().unwrap();
@@ -463,20 +484,19 @@ impl TestUtils {
             } else {
                 0
             };
-            branch_guard.size = U63::new(left_size + right_size + 1).unwrap();
+            branch_guard.size = U63::new(left_size + right_size).unwrap();
 
             // Set correct height
             branch_guard.subtree_height = U7::new(height).unwrap();
         }
 
-        // Store in database
-        let node_key = branch_node
-            .read()
-            .unwrap()
-            .node_key
-            .clone()
-            .unwrap()
-            .serialize();
-        db.insert(node_key, branch_node.read().unwrap().serialize().unwrap());
+        // Save using NodeDB's save_node method
+        let node_copy = {
+            let branch_guard = branch_node.read().unwrap();
+            Box::new(branch_guard.clone())
+        };
+        ndb.save_node(node_copy)?;
+
+        Ok(())
     }
 }

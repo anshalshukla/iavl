@@ -264,3 +264,387 @@ fn convert_inner_op_right(height: U7, size: U63, version: U63, right_hash: &Vec<
         suffix,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::TestUtils;
+    use crate::types::BoundedUintTrait;
+    use rand::Rng;
+
+    #[test]
+    fn test_get_membership_small_tree() {
+        // Create a random IAVL tree with height 3 (small tree)
+        let tree = TestUtils::create_random_iavl_tree(2).expect("Failed to create random tree");
+
+        // Collect all keys from the tree to select one randomly
+        let mut all_keys = Vec::new();
+        let mut iterator = tree
+            .clone()
+            .iterator(&[], &[], true)
+            .expect("Failed to create iterator");
+
+        while iterator.valid() {
+            all_keys.push(iterator.key().clone());
+            iterator.next();
+        }
+
+        if all_keys.is_empty() {
+            println!("No keys in tree, skipping membership test");
+            return;
+        }
+
+        // Select a random key from the tree
+        let mut rng = rand::thread_rng();
+        let random_index = rng.gen_range(0..all_keys.len());
+        let selected_key = &all_keys[random_index];
+
+        // Get the value for the selected key
+        let value = tree
+            .get(selected_key)
+            .expect("Failed to get value")
+            .expect("Key should exist");
+
+        // Create membership proof
+        let proof = tree
+            .get_membership_proof(selected_key)
+            .expect("Failed to create membership proof");
+
+        // Verify the membership proof (using correct method signature)
+        let is_valid = tree
+            .verify_membership(&proof, selected_key)
+            .expect("Failed to verify membership");
+
+        assert!(is_valid, "Membership proof should be valid");
+
+        println!(
+            "Successfully verified membership proof for key: {:?}",
+            selected_key
+        );
+    }
+
+    #[test]
+    fn test_get_membership_big_tree() {
+        // Create a random IAVL tree with height 4 (bigger tree)
+        let tree = TestUtils::create_random_iavl_tree(4).expect("Failed to create random tree");
+
+        // Collect all keys from the tree
+        let mut all_keys = Vec::new();
+        let mut iterator = tree
+            .clone()
+            .iterator(&[], &[], true)
+            .expect("Failed to create iterator");
+
+        while iterator.valid() {
+            all_keys.push(iterator.key().clone());
+            iterator.next();
+        }
+
+        if all_keys.is_empty() {
+            println!("No keys in tree, skipping membership test");
+            return;
+        }
+
+        // Test membership for multiple random keys
+        let mut rng = rand::thread_rng();
+        let test_count = std::cmp::min(5, all_keys.len()); // Test up to 5 keys
+
+        for i in 0..test_count {
+            let random_index = rng.gen_range(0..all_keys.len());
+            let selected_key = &all_keys[random_index];
+
+            println!(
+                "Testing membership for key {} of {}: {:?}",
+                i + 1,
+                test_count,
+                selected_key
+            );
+
+            // Get the value for the selected key
+            let value = tree
+                .get(selected_key)
+                .expect("Failed to get value")
+                .expect("Key should exist");
+
+            // Create membership proof
+            let proof = tree
+                .get_membership_proof(selected_key)
+                .expect("Failed to create membership proof");
+
+            // Verify the membership proof (using correct method signature)
+            let is_valid = tree
+                .verify_membership(&proof, selected_key)
+                .expect("Failed to verify membership");
+
+            assert!(
+                is_valid,
+                "Membership proof should be valid for key: {:?}",
+                selected_key
+            );
+        }
+
+        println!(
+            "Successfully verified membership proofs for {} keys",
+            test_count
+        );
+    }
+
+    #[test]
+    fn test_get_membership_different_positions() {
+        // Create a random IAVL tree
+        let tree = TestUtils::create_random_iavl_tree(3).expect("Failed to create random tree");
+
+        // Collect all keys and sort them
+        let mut all_keys = Vec::new();
+        let mut iterator = tree
+            .clone()
+            .iterator(&[], &[], true)
+            .expect("Failed to create iterator");
+
+        while iterator.valid() {
+            all_keys.push(iterator.key().clone());
+            iterator.next();
+        }
+
+        if all_keys.len() < 3 {
+            println!("Not enough keys in tree, skipping position test");
+            return;
+        }
+
+        // Test leftmost, middle, and rightmost keys (similar to Go test cases)
+        let positions = vec![
+            ("leftmost", 0),
+            ("middle", all_keys.len() / 2),
+            ("rightmost", all_keys.len() - 1),
+        ];
+
+        for (position_name, index) in positions {
+            let selected_key = &all_keys[index];
+
+            println!("Testing {} key: {:?}", position_name, selected_key);
+
+            // Get the value for the selected key
+            let value = tree
+                .get(selected_key)
+                .expect("Failed to get value")
+                .expect("Key should exist");
+
+            // Create membership proof
+            let proof = tree
+                .get_membership_proof(selected_key)
+                .expect("Failed to create membership proof");
+
+            // Verify the membership proof (using correct method signature)
+            let is_valid = tree
+                .verify_membership(&proof, selected_key)
+                .expect("Failed to verify membership");
+
+            assert!(
+                is_valid,
+                "Membership proof should be valid for {} key: {:?}",
+                position_name, selected_key
+            );
+
+            println!("Successfully verified {} membership proof", position_name);
+        }
+    }
+
+    #[test]
+    fn test_get_membership_multiple_trees() {
+        // Test membership proofs for trees of different heights
+        for height in 2..=4 {
+            println!("Testing membership for tree height: {}", height);
+
+            let tree =
+                TestUtils::create_random_iavl_tree(height).expect("Failed to create random tree");
+
+            // Get all keys
+            let mut all_keys = Vec::new();
+            let mut iterator = tree
+                .clone()
+                .iterator(&[], &[], true)
+                .expect("Failed to create iterator");
+
+            while iterator.valid() {
+                all_keys.push(iterator.key().clone());
+                iterator.next();
+            }
+
+            if all_keys.is_empty() {
+                println!("No keys in tree height {}, skipping", height);
+                continue;
+            }
+
+            // Test a few random keys from this tree
+            let mut rng = rand::thread_rng();
+            let test_count = std::cmp::min(3, all_keys.len());
+
+            for i in 0..test_count {
+                let random_index = rng.gen_range(0..all_keys.len());
+                let selected_key = &all_keys[random_index];
+
+                // Get value and create proof
+                let value = tree
+                    .get(selected_key)
+                    .expect("Failed to get value")
+                    .expect("Key should exist");
+                let proof = tree
+                    .get_membership_proof(selected_key)
+                    .expect("Failed to create membership proof");
+
+                // Verify proof (using correct method signature)
+                let is_valid = tree
+                    .verify_membership(&proof, selected_key)
+                    .expect("Failed to verify membership");
+
+                assert!(
+                    is_valid,
+                    "Membership proof should be valid for height {} key: {:?}",
+                    height, selected_key
+                );
+            }
+
+            println!(
+                "Successfully verified {} membership proofs for height {}",
+                test_count, height
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_membership_with_mock_trees() {
+        // Test with simpler mock trees as well
+
+        // Test single node tree
+        let single_tree =
+            TestUtils::create_mock_tree_with_root().expect("Failed to create single node tree");
+        let key = 6u32.to_be_bytes().to_vec();
+        let value = single_tree
+            .get(&key)
+            .expect("Failed to get value")
+            .expect("Key should exist");
+
+        let proof = single_tree
+            .get_membership_proof(&key)
+            .expect("Failed to create membership proof");
+        // Verify using correct method signature (only proof and key)
+        let is_valid = single_tree
+            .verify_membership(&proof, &key)
+            .expect("Failed to verify membership");
+
+        assert!(
+            is_valid,
+            "Membership proof should be valid for single node tree"
+        );
+        println!("Successfully verified membership for single node tree");
+
+        // Test tree with children
+        let tree_with_children = TestUtils::create_mock_tree_with_root_and_children()
+            .expect("Failed to create tree with children");
+
+        // Test all three keys in the tree
+        let test_keys = vec![5u32, 6u32, 7u32];
+
+        for test_key in test_keys {
+            let key_bytes = test_key.to_be_bytes().to_vec();
+            let value = tree_with_children
+                .get(&key_bytes)
+                .expect("Failed to get value")
+                .expect("Key should exist");
+
+            let proof = tree_with_children
+                .get_membership_proof(&key_bytes)
+                .expect("Failed to create membership proof");
+            // Verify using correct method signature (only proof and key)
+            let is_valid = tree_with_children
+                .verify_membership(&proof, &key_bytes)
+                .expect("Failed to verify membership");
+
+            assert!(
+                is_valid,
+                "Membership proof should be valid for key: {}",
+                test_key
+            );
+        }
+
+        println!("Successfully verified membership for tree with children");
+    }
+
+    #[test]
+    fn test_get_non_membership_proof() {
+        // Create a random IAVL tree
+        let tree = TestUtils::create_random_iavl_tree(3).expect("Failed to create random tree");
+
+        // Test with a key that definitely doesn't exist
+        let non_existent_key = 999999u32.to_be_bytes().to_vec();
+
+        // Verify the key doesn't exist
+        let exists = tree
+            .has(&non_existent_key)
+            .expect("Failed to check key existence");
+        assert!(!exists, "Key should not exist in tree");
+
+        // Create non-membership proof
+        let proof = tree
+            .get_non_membership_proof(&non_existent_key)
+            .expect("Failed to create non-membership proof");
+
+        // Verify the non-membership proof
+        let is_valid = tree
+            .verify_non_membership(&proof, &non_existent_key)
+            .expect("Failed to verify non-membership");
+
+        assert!(is_valid, "Non-membership proof should be valid");
+
+        println!(
+            "Successfully verified non-membership proof for key: {:?}",
+            non_existent_key
+        );
+    }
+
+    #[test]
+    fn test_get_proof_automatic() {
+        // Create a random IAVL tree
+        let tree = TestUtils::create_random_iavl_tree(3).expect("Failed to create random tree");
+
+        // Get one existing key
+        let mut iterator = tree
+            .clone()
+            .iterator(&[], &[], true)
+            .expect("Failed to create iterator");
+
+        if !iterator.valid() {
+            println!("No keys in tree, skipping automatic proof test");
+            return;
+        }
+
+        let existing_key = iterator.key().clone();
+        let non_existent_key = 999999u32.to_be_bytes().to_vec();
+
+        // Test automatic proof for existing key (should be membership proof)
+        let membership_proof = tree
+            .get_proof(&existing_key)
+            .expect("Failed to get proof for existing key");
+        let is_membership_valid = tree
+            .verify_proof(&membership_proof, &existing_key)
+            .expect("Failed to verify membership proof");
+        assert!(
+            is_membership_valid,
+            "Automatic membership proof should be valid"
+        );
+
+        // Test automatic proof for non-existent key (should be non-membership proof)
+        let non_membership_proof = tree
+            .get_proof(&non_existent_key)
+            .expect("Failed to get proof for non-existent key");
+        let is_non_membership_valid = tree
+            .verify_proof(&non_membership_proof, &non_existent_key)
+            .expect("Failed to verify non-membership proof");
+        assert!(
+            is_non_membership_valid,
+            "Automatic non-membership proof should be valid"
+        );
+
+        println!("Successfully verified automatic proof selection");
+    }
+}

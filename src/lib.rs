@@ -91,6 +91,8 @@ const NODE_KEY_LENGTH: usize = VERSION_BYTE_LENGTH + NONCE_BYTE_LENGTH;
 // non legacy
 const MODE: u64 = 0;
 
+const NODE_DB_KEY_LEN: usize = size_of::<u8>() + size_of::<u64>() + size_of::<u32>(); // 13
+
 impl NodeKey {
     fn serialize(&self) -> Vec<u8> {
         let mut result = Vec::new();
@@ -125,6 +127,22 @@ impl NodeKey {
         result.extend_from_slice(&U31::new(1).unwrap().to_be_bytes());
 
         result
+    }
+
+    fn get_key(&self) -> Vec<u8> {
+        let mut result = Vec::with_capacity(NODE_KEY_LENGTH);
+        result.extend(self.version.to_be_bytes());
+        result.extend_from_slice(&self.nonce.to_be_bytes());
+
+        result
+    }
+
+    pub fn make_node_db_key(&self, prefix: u8) -> [u8; NODE_DB_KEY_LEN] {
+        let mut key = [0; NODE_DB_KEY_LEN];
+        key[0] = prefix;
+        key[1..=size_of::<u64>()].copy_from_slice(&self.version.get().to_be_bytes());
+        key[1 + size_of::<u64>()..].copy_from_slice(&self.nonce.get().to_be_bytes());
+        key
     }
 }
 
@@ -220,7 +238,7 @@ impl Node {
                 .hash_with_count(version);
         }
 
-        self.calculate_hash_bytes(version)
+        self._hash(version)
     }
 
     // Serializes the node as a byte slice
@@ -815,6 +833,28 @@ mod tests {
         inner_node
     }
 
+    fn leaf_node_without_hash() -> Box<Node> {
+        let leaf_node = Node {
+            subtree_height: types::U7::new(0).unwrap(),
+            size: types::U63::new(1).unwrap(),
+            key: "key".into(),
+            node_key: Some(Box::new(NodeKey {
+                version: types::U63::new(3).unwrap(),
+                nonce: types::U31::new(1).unwrap(),
+            })),
+            left_node_key: None,
+            right_node_key: None,
+            hash: vec![],
+            value: Some("value".into()),
+            left_node: None,
+            right_node: None,
+        };
+
+        let leaf_node = Box::new(leaf_node);
+
+        leaf_node
+    }
+
     fn leaf_node() -> Box<Node> {
         let leaf_node = Node {
             subtree_height: types::U7::new(0).unwrap(),
@@ -839,6 +879,29 @@ mod tests {
         let leaf_node = Box::new(leaf_node);
 
         leaf_node
+    }
+
+    #[test]
+    fn test_node_hash() {
+        let mut node = leaf_node_without_hash();
+        // let hash = node.hash_with_count(types::U63::new(3).unwrap());
+        println!(
+            "Testing log: node: {:?}",
+            node._hash(types::U63::new(3).unwrap())
+        );
+
+        println!(
+            "Testing log: h node: {:?}",
+            node.calculate_hash_bytes(types::U63::new(3).unwrap())
+        );
+        println!("Testing log: key: {:?}", node.key);
+        println!("Testing log: value: {:?}", node.value);
+        println!(
+            "Testing log: hash: {:?}",
+            node.hash_with_count(types::U63::new(3).unwrap())
+        );
+
+        // println!("Testing log: hash: {:?}", hash);
     }
 
     #[rstest]

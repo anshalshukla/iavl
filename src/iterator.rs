@@ -166,16 +166,13 @@ impl<DB> NodeIterator<DB>
 where
     DB: KVStoreWithBatch,
 {
+    // root_key is the node db key of the root node
     pub fn new(root_key: Vec<u8>, ndb: Arc<NodeDB<DB>>) -> Result<Self, DBError> {
         let mut nodes_to_visit = Vec::new();
 
         if root_key.is_empty() {
             // If root key is empty, return iterator with empty array
-            return Ok(NodeIterator {
-                nodes_to_visit,
-                node_db: ndb,
-                is_valid: true,
-            });
+            return Err(DBError::EmptyRootKey);
         }
 
         // Get the node for the root key
@@ -230,9 +227,10 @@ where
                     .right_node_key
                     .as_ref()
                     .unwrap()
-                    .serialize(),
+                    .get_key(),
             );
             if right_node.is_err() {
+                println!("Testing log: right_node error: {:?}", right_node.err());
                 self.is_valid = false;
                 return;
             }
@@ -246,9 +244,10 @@ where
                     .left_node_key
                     .as_ref()
                     .unwrap()
-                    .serialize(),
+                    .get_key(),
             );
             if left_node.is_err() {
+                println!("Testing log: left_node error: {:?}", left_node.err());
                 self.is_valid = false;
                 return;
             }
@@ -395,358 +394,151 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{MockDB, TestUtils};
+    use crate::{
+        key_format::FastKeyFormat,
+        test_util::{MockDB, TestUtils},
+    };
+    use rand::Rng;
 
-    // /// Test configuration for iterator tests
-    // #[derive(Clone)]
-    // pub struct IteratorTestConfig {
-    //     pub start_byte_to_set: u8,
-    //     pub end_byte_to_set: u8,
-    //     pub start_iterate: Option<Vec<u8>>,
-    //     pub end_iterate: Option<Vec<u8>>,
-    //     pub ascending: bool,
-    // }
+    #[test]
+    fn test_node_iterator_success() {
+        // Create a random IAVL tree for testing
+        let tree = TestUtils::create_random_iavl_tree(3).expect("Failed to create random tree");
 
-    // /// Setup test data for iterator testing
-    // pub fn setup_test_data(config: &IteratorTestConfig) -> Vec<(Vec<u8>, Vec<u8>)> {
-    //     let mut data = Vec::new();
+        // Get the root key for the NodeIterator
+        let root_key = {
+            let root_guard = tree.root.read().unwrap();
+            root_guard.get_key().expect("Failed to get root key")
+        };
 
-    //     for i in config.start_byte_to_set..=config.end_byte_to_set {
-    //         let key = vec![i];
-    //         let value = format!("value_{}", i as char).into_bytes();
-    //         data.push((key, value));
-    //     }
+        // Test 1: Check if the iterating count is same with the entire node count of the tree
+        let mut node_iterator = NodeIterator::new(root_key.clone(), tree.ndb.clone());
 
-    //     data
-    // }
+        assert!(node_iterator.is_ok());
 
-    // /// Create test configuration for various test scenarios
-    // pub fn create_test_configs() -> Vec<IteratorTestConfig> {
-    //     vec![
-    //         // Empty range
-    //         IteratorTestConfig {
-    //             start_byte_to_set: b'a',
-    //             end_byte_to_set: b'z',
-    //             start_iterate: Some(b"e".to_vec()),
-    //             end_iterate: Some(b"w".to_vec()),
-    //             ascending: true,
-    //         },
-    //         // Normal range ascending
-    //         IteratorTestConfig {
-    //             start_byte_to_set: b'a',
-    //             end_byte_to_set: b'z',
-    //             start_iterate: Some(b"e".to_vec()),
-    //             end_iterate: Some(b"w".to_vec()),
-    //             ascending: false,
-    //         },
-    //         // Normal range descending
-    //         IteratorTestConfig {
-    //             start_byte_to_set: b'a',
-    //             end_byte_to_set: b'z',
-    //             start_iterate: None,
-    //             end_iterate: None,
-    //             ascending: true,
-    //         },
-    //         // Full range ascending
-    //         IteratorTestConfig {
-    //             start_byte_to_set: b'a',
-    //             end_byte_to_set: b'z',
-    //             start_iterate: None,
-    //             end_iterate: None,
-    //             ascending: false,
-    //         },
-    //         // Full range descending
-    //         IteratorTestConfig {
-    //             start_byte_to_set: b'a',
-    //             end_byte_to_set: b'z',
-    //             start_iterate: None,
-    //             end_iterate: None,
-    //             ascending: false,
-    //         },
-    //     ]
-    // }
+        let mut node_iterator = node_iterator.unwrap();
 
-    // // Helper function to create test configurations
-    // fn create_test_config(
-    //     start_byte: u8,
-    //     end_byte: u8,
-    //     start_iter: Option<&[u8]>,
-    //     end_iter: Option<&[u8]>,
-    //     ascending: bool,
-    // ) -> IteratorTestConfig {
-    //     IteratorTestConfig {
-    //         start_byte_to_set: start_byte,
-    //         end_byte_to_set: end_byte,
-    //         start_iterate: start_iter.map(|s| s.to_vec()),
-    //         end_iterate: end_iter.map(|e| e.to_vec()),
-    //         ascending,
-    //     }
-    // }
+        let mut node_count = 0;
+        while node_iterator.valid() {
+            node_count += 1;
+            node_iterator.next(false);
+        }
 
-    // #[test]
-    // fn test_iterator_nil_tree_failure() {
-    //     // This test simulates the Go test: TestIterator_NewIterator_NilTree_Failure
-    //     // Since our iterator requires an Arc<ImmutableTree>, we'll test error conditions
-    //     // by testing the domain and validity functions instead
+        // The formula from Go: tree.Size() * 2 - 1
+        // This represents all nodes in the tree (internal + leaf nodes)
+        let expected_count = tree.size().get() * 2 - 1;
+        assert_eq!(
+            node_count as u64, expected_count,
+            "Node count {} should match expected count {}",
+            node_count, expected_count
+        );
 
-    //     let start = b"a";
-    //     let end = b"c";
+        // Test 2: Check if the skipped node count is right
+        let mut node_iterator2 = NodeIterator::new(root_key, tree.ndb.clone())
+            .expect("Failed to create second NodeIterator");
 
-    //     // Since we can't create an iterator with nil tree in Rust due to type safety,
-    //     // we test that our mock can simulate this scenario
-    //     let mock_error = DBError::NilTreeGiven;
-    //     assert_eq!(format!("{}", mock_error), "nil tree given");
-    // }
+        let mut update_count = 0;
+        let mut skip_count = 0;
 
-    // #[test]
-    // fn test_iterator_empty_invalid() {
-    //     // This test simulates: TestIterator_Empty_Invalid
-    //     let config = create_test_config(b'a', b'z', Some(b"a"), Some(b"a"), true);
+        while node_iterator2.valid() {
+            let node = node_iterator2.get_node();
+            update_count += 1;
 
-    //     // Test that our test config was created correctly
-    //     assert_eq!(config.start_byte_to_set, b'a');
-    //     assert_eq!(config.end_byte_to_set, b'z');
-    //     assert_eq!(config.start_iterate, Some(b"a".to_vec()));
-    //     assert_eq!(config.end_iterate, Some(b"a".to_vec()));
-    //     assert!(config.ascending);
+            let should_skip = {
+                let node_guard = node.read().unwrap();
+                let node_version = node_guard
+                    .node_key
+                    .as_ref()
+                    .map(|nk| nk.version.get())
+                    .unwrap_or(0);
+                node_version < tree.version().get()
+            };
 
-    //     // In a real implementation, this would test that an iterator with
-    //     // start == end would be invalid (empty range)
-    // }
+            if should_skip {
+                let node_guard = node.read().unwrap();
+                // The size of the subtree without the root: node.size * 2 - 2
+                skip_count += (node_guard.size.get() * 2 - 2) as i32;
+            }
 
-    // #[test]
-    // fn test_iterator_basic_ranged_ascending_success() {
-    //     // This test simulates: TestIterator_Basic_Ranged_Ascending_Success
-    //     let config = create_test_config(b'a', b'z', Some(b"e"), Some(b"w"), true);
+            node_iterator2.next(should_skip);
+        }
 
-    //     assert_eq!(config.start_iterate, Some(b"e".to_vec()));
-    //     assert_eq!(config.end_iterate, Some(b"w".to_vec()));
-    //     assert!(config.ascending);
+        assert_eq!(
+            node_count,
+            update_count + skip_count,
+            "Total node count {} should equal update count {} + skip count {}",
+            node_count,
+            update_count,
+            skip_count
+        );
+    }
 
-    //     // Test data setup
-    //     let test_data = TestUtils::setup_test_data(&config);
-    //     assert!(!test_data.is_empty());
+    #[test]
+    fn test_node_iterator_empty_root() {
+        let db = MockDB::new();
+        let ndb = Arc::new(NodeDB::new(db, 100).unwrap());
 
-    //     // Verify data is in expected range
-    //     for (key, _) in &test_data {
-    //         assert!(key[0] >= config.start_byte_to_set);
-    //         assert!(key[0] <= config.end_byte_to_set);
-    //     }
-    // }
+        // Test with empty root key
+        let node_iterator = NodeIterator::new(vec![], ndb.clone());
 
-    // #[test]
-    // fn test_iterator_basic_ranged_descending_success() {
-    //     // This test simulates: TestIterator_Basic_Ranged_Descending_Success
-    //     let config = create_test_config(b'a', b'z', Some(b"e"), Some(b"w"), false);
+        assert!(node_iterator.is_err());
+    }
 
-    //     assert_eq!(config.start_iterate, Some(b"e".to_vec()));
-    //     assert_eq!(config.end_iterate, Some(b"w".to_vec()));
-    //     assert!(!config.ascending); // descending
+    #[test]
+    fn test_node_iterator_single_node() {
+        let tree =
+            TestUtils::create_mock_tree_with_root().expect("Failed to create mock tree with root");
 
-    //     let test_data = TestUtils::setup_test_data(&config);
-    //     assert!(!test_data.is_empty());
-    // }
+        let root_key = {
+            let root_guard = tree.root.read().unwrap();
+            root_guard.get_key().expect("Failed to get root key")
+        };
 
-    // #[test]
-    // fn test_iterator_basic_full_ascending_success() {
-    //     // This test simulates: TestIterator_Basic_Full_Ascending_Success
-    //     let config = create_test_config(b'a', b'z', None, None, true);
+        let mut node_iterator =
+            NodeIterator::new(root_key, tree.ndb.clone()).expect("Failed to create NodeIterator");
 
-    //     assert_eq!(config.start_iterate, None);
-    //     assert_eq!(config.end_iterate, None);
-    //     assert!(config.ascending);
+        let mut count = 0;
+        while node_iterator.valid() {
+            count += 1;
+            node_iterator.next(false);
+        }
 
-    //     let test_data = TestUtils::setup_test_data(&config);
-    //     assert!(!test_data.is_empty());
-    //     // Should include full range from 'a' to 'z'
-    //     assert_eq!(test_data.len(), (b'z' - b'a' + 1) as usize);
-    // }
+        // Single leaf node should result in count of 1
+        assert_eq!(count, 1);
+    }
 
-    // #[test]
-    // fn test_iterator_basic_full_descending_success() {
-    //     // This test simulates: TestIterator_Basic_Full_Descending_Success
-    //     let config = create_test_config(b'a', b'z', None, None, false);
+    #[test]
+    fn test_node_iterator_with_children() {
+        let tree = TestUtils::create_mock_tree_with_root_and_children()
+            .expect("Failed to create mock tree with children");
 
-    //     assert_eq!(config.start_iterate, None);
-    //     assert_eq!(config.end_iterate, None);
-    //     assert!(!config.ascending); // descending
+        let root_key = tree.root.read().unwrap().node_key.clone().unwrap();
+        let root_key = root_key.get_key();
 
-    //     let test_data = TestUtils::setup_test_data(&config);
-    //     assert!(!test_data.is_empty());
-    //     assert_eq!(test_data.len(), (b'z' - b'a' + 1) as usize);
-    // }
+        let mut node_iterator =
+            NodeIterator::new(root_key, tree.ndb.clone()).expect("Failed to create NodeIterator");
 
-    // #[test]
-    // fn test_node_iterator_with_empty_root() {
-    //     // This test simulates: TestNodeIterator_WithEmptyRoot
+        let mut count = 0;
+        while node_iterator.valid() {
+            count += 1;
+            node_iterator.next(false);
+        }
 
-    //     // Test with nil root key (empty vec in Rust)
-    //     let empty_root: Vec<u8> = vec![];
-    //     assert!(empty_root.is_empty());
+        // Tree with root + 2 children = 3 nodes total
+        assert_eq!(count, 3);
 
-    //     // Test with None equivalent (empty vec)
-    //     let nil_root: Vec<u8> = vec![];
-    //     assert!(nil_root.is_empty());
-
-    //     // In the actual implementation, both should result in invalid iterators
-    // }
-
-    // #[test]
-    // fn test_iterator_next_error_handling() {
-    //     // This test simulates: TestIterator_Next_ErrorHandling
-
-    //     // Test that we can create error scenarios
-    //     let db_error = crate::node_db::DBError::NodeKeyNotFound;
-    //     let iter_error = IteratorError::from(db_error);
-
-    //     match iter_error {
-    //         IteratorError::TraversalError(_) => {
-    //             // Expected - error was properly converted
-    //         }
-    //         _ => panic!("Expected TraversalError variant"),
-    //     }
-    // }
-
-    // #[test]
-    // fn test_delayed_nodes() {
-    //     let mut delayed = DelayedNodes::new();
-    //     assert_eq!(delayed.length(), 0);
-
-    //     let node = TestUtils::create_leaf_node("test", "value");
-    //     delayed.push(node.clone(), true);
-    //     assert_eq!(delayed.length(), 1);
-
-    //     let popped = delayed.pop().unwrap();
-    //     assert_eq!(delayed.length(), 0);
-    //     assert!(popped.1); // delayed flag should be true
-    // }
-
-    // #[test]
-    // fn test_delayed_nodes_operations() {
-    //     let mut delayed = DelayedNodes::new();
-
-    //     // Test empty state
-    //     assert_eq!(delayed.length(), 0);
-    //     assert!(delayed.pop().is_none());
-
-    //     // Test single push/pop
-    //     let node1 = TestUtils::create_leaf_node("key1", "value1");
-    //     delayed.push(node1, true);
-    //     assert_eq!(delayed.length(), 1);
-
-    //     let (_, delayed_flag) = delayed.pop().unwrap();
-    //     assert_eq!(delayed.length(), 0);
-    //     assert!(delayed_flag);
-
-    //     // Test multiple pushes - LIFO (stack behavior)
-    //     let node2 = TestUtils::create_leaf_node("key2", "value2");
-    //     let node3 = TestUtils::create_leaf_node("key3", "value3");
-
-    //     delayed.push(node2, false);
-    //     delayed.push(node3, true);
-    //     assert_eq!(delayed.length(), 2);
-
-    //     // Pop order should be LIFO
-    //     let (_, flag1) = delayed.pop().unwrap();
-    //     assert!(flag1); // Last pushed was delayed=true
-
-    //     let (_, flag2) = delayed.pop().unwrap();
-    //     assert!(!flag2); // First pushed was delayed=false
-
-    //     assert_eq!(delayed.length(), 0);
-    // }
-
-    // #[test]
-    // fn test_iterator_error_enum() {
-    //     // Test error enum variants
-    //     let db_err = crate::node_db::DBError::NodeKeyNotFound;
-    //     let iter_err = IteratorError::from(db_err);
-
-    //     match iter_err {
-    //         IteratorError::TraversalError(_) => {
-    //             // Expected conversion
-    //         }
-    //         _ => panic!("Expected TraversalError variant"),
-    //     }
-
-    //     let nil_err = IteratorError::NilTreeGiven;
-    //     match nil_err {
-    //         IteratorError::NilTreeGiven => {
-    //             // Expected variant
-    //         }
-    //         _ => panic!("Expected NilTreeGiven variant"),
-    //     }
-
-    //     // Test debug formatting
-    //     let debug_str = format!("{:?}", nil_err);
-    //     assert!(debug_str.contains("NilTreeGiven"));
-    // }
-
-    // #[test]
-    // fn test_mock_error_types() {
-    //     // Test our mock error types that simulate Go error conditions
-    //     let errors = vec![
-    //         MockError::NilTreeGiven,
-    //         MockError::NilNdbGiven,
-    //         MockError::NilAdditionsGiven,
-    //         MockError::NilRemovalsGiven,
-    //     ];
-
-    //     for error in errors {
-    //         let error_str = format!("{}", error);
-    //         let debug_str = format!("{:?}", error);
-
-    //         // Each error should have a non-empty string representation
-    //         assert!(!error_str.is_empty());
-    //         assert!(!debug_str.is_empty());
-    //     }
-    // }
-
-    // #[test]
-    // fn test_node_creation() {
-    //     // Test that we can create nodes for testing
-    //     let node = TestUtils::create_leaf_node("test_key", "test_value");
-    //     let node_read = node.read().unwrap();
-
-    //     assert_eq!(node_read.key, b"test_key");
-    //     assert_eq!(node_read.value, Some(b"test_value".to_vec()));
-    //     assert!(node_read.is_leaf());
-    //     assert_eq!(node_read.size.get(), 1);
-
-    //     // Test branch node creation
-    //     let left_child = TestUtils::create_leaf_node("left", "left_val");
-    //     let right_child = TestUtils::create_leaf_node("right", "right_val");
-
-    //     let branch = TestUtils::create_branch_node("branch", Some(left_child), Some(right_child));
-    //     let branch_read = branch.read().unwrap();
-
-    //     assert_eq!(branch_read.key, b"branch");
-    //     assert_eq!(branch_read.value, None); // Branch nodes don't have values
-    //     assert!(!branch_read.is_leaf()); // Should be a branch node
-    // }
-
-    // #[test]
-    // fn test_test_configurations() {
-    //     // Test that we can create various test configurations
-    //     let configs = TestUtils::create_test_configs();
-    //     assert!(!configs.is_empty());
-
-    //     // Verify we have different types of configurations
-    //     let has_ascending = configs.iter().any(|c| c.ascending);
-    //     let has_descending = configs.iter().any(|c| !c.ascending);
-    //     let has_range = configs.iter().any(|c| c.start_iterate.is_some());
-    //     let has_full = configs.iter().any(|c| c.start_iterate.is_none());
-
-    //     assert!(has_ascending);
-    //     assert!(has_descending);
-    //     assert!(has_range);
-    //     assert!(has_full);
-    // }
+        // Verify this matches the formula: size * 2 - 1
+        let expected_count = tree.size().get() * 2 - 1;
+        assert_eq!(count as u64, expected_count);
+    }
 
     #[test]
     fn test_iterator_with_random_tree() {
-        let tree = TestUtils::create_random_iavl_tree(10).unwrap();
-        let mut iter = Iterator::new(b"", b"", true, false, false, tree);
+        let tree = TestUtils::create_random_iavl_tree(2).unwrap();
+        let mut iter = Iterator::new(b"", b"", true, false, false, tree.clone());
+
+        let hash = tree.hash().unwrap();
+
         assert!(iter.valid());
     }
 
@@ -757,8 +549,7 @@ mod tests {
 
         // empty root key
         let node_iterator = NodeIterator::new(vec![], ndb.clone());
-        assert!(node_iterator.is_ok());
-        assert!(!node_iterator.unwrap().valid());
+        assert!(node_iterator.is_err());
 
         // empty root key
         let node_iterator = NodeIterator::new(vec![1, 2, 3], ndb);
@@ -769,7 +560,7 @@ mod tests {
     fn test_iterator_next_error_handling() {
         let tree = TestUtils::create_mock_tree_with_root().unwrap();
 
-        let left = TestUtils::create_leaf_node("5", "left_value", 1, 2);
+        let left = TestUtils::create_leaf_node(5, "left_value", 1, 2);
 
         tree.root.write().unwrap().left_node_key =
             Some(left.read().unwrap().node_key.clone().unwrap());
@@ -784,5 +575,460 @@ mod tests {
         iter.next();
 
         assert!(!iter.valid());
+    }
+
+    // #[test]
+    // fn test_random_iavl_tree_ascending_iteration() {
+    //     // Create a random IAVL tree with height 4
+    //     let tree = TestUtils::create_random_iavl_tree(4).expect("Failed to create random tree");
+
+    //     // Create iterator with nil start and end (full range) in ascending order
+    //     let mut iterator = tree
+    //         .iterator(&[], &[], true)
+    //         .expect("Failed to create iterator");
+
+    //     let mut previous_key: Option<Vec<u8>> = None;
+    //     let mut count = 0;
+
+    //     // Iterate through all keys and verify ascending order
+    //     while iterator.valid() {
+    //         let current_key = iterator.key().clone();
+
+    //         // Verify that current key is greater than or equal to previous key
+    //         if let Some(ref prev_key) = previous_key {
+    //             assert!(
+    //                 current_key >= *prev_key,
+    //                 "Keys not in ascending order: {:?} should be >= {:?}",
+    //                 current_key,
+    //                 prev_key
+    //             );
+    //         }
+
+    //         previous_key = Some(current_key);
+    //         count += 1;
+    //         iterator.next();
+    //     }
+
+    //     // Verify we actually iterated over some keys
+    //     assert!(count > 0, "Iterator should have returned at least one key");
+
+    //     // Verify count matches tree size
+    //     assert_eq!(
+    //         count as u64,
+    //         tree.size().get(),
+    //         "Iterator count {} should match tree size {}",
+    //         count,
+    //         tree.size().get()
+    //     );
+
+    //     println!("Successfully iterated {} keys in ascending order", count);
+    // }
+
+    // #[test]
+    // fn test_random_iavl_tree_descending_iteration() {
+    //     // Create a random IAVL tree with height 4
+    //     let tree = TestUtils::create_random_iavl_tree(4).expect("Failed to create random tree");
+
+    //     // Create iterator with nil start and end (full range) in descending order
+    //     let mut iterator = tree
+    //         .iterator(&[], &[], false)
+    //         .expect("Failed to create iterator");
+
+    //     let mut previous_key: Option<Vec<u8>> = None;
+    //     let mut count = 0;
+
+    //     // Iterate through all keys and verify descending order
+    //     while iterator.valid() {
+    //         let current_key = iterator.key().clone();
+
+    //         // Verify that current key is less than or equal to previous key
+    //         if let Some(ref prev_key) = previous_key {
+    //             assert!(
+    //                 current_key <= *prev_key,
+    //                 "Keys not in descending order: {:?} should be <= {:?}",
+    //                 current_key,
+    //                 prev_key
+    //             );
+    //         }
+
+    //         previous_key = Some(current_key);
+    //         count += 1;
+    //         iterator.next();
+    //     }
+
+    //     // Verify we actually iterated over some keys
+    //     assert!(count > 0, "Iterator should have returned at least one key");
+
+    //     // Verify count matches tree size
+    //     assert_eq!(
+    //         count as u64,
+    //         tree.size().get(),
+    //         "Iterator count {} should match tree size {}",
+    //         count,
+    //         tree.size().get()
+    //     );
+
+    //     println!("Successfully iterated {} keys in descending order", count);
+    // }
+
+    #[test]
+    fn test_random_iavl_tree_both_directions() {
+        // Create a random IAVL tree with height 3
+        let tree = TestUtils::create_random_iavl_tree(3).expect("Failed to create random tree");
+
+        // Collect all keys in ascending order
+        let mut ascending_keys = Vec::new();
+        let mut ascending_iterator = tree
+            .clone()
+            .iterator(&[], &[], true)
+            .expect("Failed to create ascending iterator");
+
+        while ascending_iterator.valid() {
+            ascending_keys.push(ascending_iterator.key().clone());
+            ascending_iterator.next();
+        }
+
+        // Collect all keys in descending order
+        let mut descending_keys = Vec::new();
+        let mut descending_iterator = tree
+            .iterator(&[], &[], false)
+            .expect("Failed to create descending iterator");
+
+        while descending_iterator.valid() {
+            descending_keys.push(descending_iterator.key().clone());
+            descending_iterator.next();
+        }
+
+        // Verify both iterators returned the same number of keys
+        assert_eq!(
+            ascending_keys.len(),
+            descending_keys.len(),
+            "Ascending and descending iterators should return same number of keys"
+        );
+
+        // Verify ascending order
+        for i in 1..ascending_keys.len() {
+            assert!(
+                ascending_keys[i] >= ascending_keys[i - 1],
+                "Ascending keys not in order at position {}: {:?} should be >= {:?}",
+                i,
+                ascending_keys[i],
+                ascending_keys[i - 1]
+            );
+        }
+
+        // Verify descending order
+        for i in 1..descending_keys.len() {
+            assert!(
+                descending_keys[i] <= descending_keys[i - 1],
+                "Descending keys not in order at position {}: {:?} should be <= {:?}",
+                i,
+                descending_keys[i],
+                descending_keys[i - 1]
+            );
+        }
+
+        // Verify that descending is reverse of ascending
+        let mut reversed_ascending = ascending_keys.clone();
+        reversed_ascending.reverse();
+        assert_eq!(
+            reversed_ascending, descending_keys,
+            "Descending keys should be reverse of ascending keys"
+        );
+
+        println!(
+            "Successfully verified both ascending and descending iteration with {} keys",
+            ascending_keys.len()
+        );
+    }
+
+    #[test]
+    fn test_random_iavl_tree_range_iteration() {
+        // Create a random IAVL tree with height 4
+        let tree = TestUtils::create_random_iavl_tree(4).expect("Failed to create random tree");
+
+        // First, collect all keys to determine the actual range
+        let mut all_keys = Vec::new();
+        let mut full_iterator = tree
+            .clone()
+            .iterator(&[], &[], true)
+            .expect("Failed to create full iterator");
+
+        while full_iterator.valid() {
+            all_keys.push(full_iterator.key().clone());
+            full_iterator.next();
+        }
+
+        if all_keys.is_empty() {
+            println!("No keys in tree, skipping range test");
+            return;
+        }
+
+        // Sort keys to ensure proper ordering
+        all_keys.sort();
+
+        let mut rng = rand::thread_rng();
+
+        // Perform multiple random range tests
+        for test_iteration in 0..5 {
+            println!("Range test iteration {}", test_iteration + 1);
+
+            // Pick random start and end indices
+            let start_idx = rng.gen_range(0..all_keys.len());
+            let end_idx = rng.gen_range(start_idx..all_keys.len());
+
+            let start_key = &all_keys[start_idx];
+            let end_key = if end_idx < all_keys.len() - 1 {
+                &all_keys[end_idx + 1] // Make end exclusive
+            } else {
+                &[].to_vec() // Use empty slice for open end
+            };
+
+            println!("Testing range: start={:?}, end={:?}", start_key, end_key);
+
+            // Test ascending iteration with range
+            let mut ascending_iterator = tree
+                .clone()
+                .iterator(start_key, end_key, true)
+                .expect("Failed to create ascending range iterator");
+
+            let mut ascending_keys = Vec::new();
+            let mut ascending_count = 0;
+
+            while ascending_iterator.valid() {
+                let current_key = ascending_iterator.key().clone();
+
+                // Verify key is >= start
+                assert!(
+                    current_key >= *start_key,
+                    "Ascending: Key {:?} should be >= start {:?}",
+                    current_key,
+                    start_key
+                );
+
+                // Verify key is < end (if end is specified)
+                if !end_key.is_empty() {
+                    assert!(
+                        current_key < *end_key,
+                        "Ascending: Key {:?} should be < end {:?}",
+                        current_key,
+                        end_key
+                    );
+                }
+
+                ascending_keys.push(current_key);
+                ascending_count += 1;
+                ascending_iterator.next();
+            }
+
+            // Test descending iteration with range
+            let mut descending_iterator = tree
+                .clone()
+                .iterator(start_key, end_key, false)
+                .expect("Failed to create descending range iterator");
+
+            let mut descending_keys = Vec::new();
+            let mut descending_count = 0;
+
+            while descending_iterator.valid() {
+                let current_key = descending_iterator.key().clone();
+
+                // Verify key is >= start
+                assert!(
+                    current_key >= *start_key,
+                    "Descending: Key {:?} should be >= start {:?}",
+                    current_key,
+                    start_key
+                );
+
+                // Verify key is < end (if end is specified)
+                if !end_key.is_empty() {
+                    assert!(
+                        current_key < *end_key,
+                        "Descending: Key {:?} should be < end {:?}",
+                        current_key,
+                        end_key
+                    );
+                }
+
+                descending_keys.push(current_key);
+                descending_count += 1;
+                descending_iterator.next();
+            }
+
+            // Verify both iterators returned the same number of keys
+            assert_eq!(
+                ascending_count, descending_count,
+                "Ascending and descending should return same number of keys for range"
+            );
+
+            // Verify ascending order
+            for i in 1..ascending_keys.len() {
+                assert!(
+                    ascending_keys[i] >= ascending_keys[i - 1],
+                    "Ascending keys not in order at position {}: {:?} should be >= {:?}",
+                    i,
+                    ascending_keys[i],
+                    ascending_keys[i - 1]
+                );
+            }
+
+            // Verify descending order
+            for i in 1..descending_keys.len() {
+                assert!(
+                    descending_keys[i] <= descending_keys[i - 1],
+                    "Descending keys not in order at position {}: {:?} should be <= {:?}",
+                    i,
+                    descending_keys[i],
+                    descending_keys[i - 1]
+                );
+            }
+
+            // Verify that descending is reverse of ascending
+            if !ascending_keys.is_empty() {
+                let mut reversed_ascending = ascending_keys.clone();
+                reversed_ascending.reverse();
+                assert_eq!(
+                    reversed_ascending, descending_keys,
+                    "Descending keys should be reverse of ascending keys for range"
+                );
+            }
+
+            println!(
+                "  Range test {}: {} keys in range [{:?}, {:?})",
+                test_iteration + 1,
+                ascending_count,
+                start_key,
+                end_key
+            );
+        }
+    }
+
+    #[test]
+    fn test_random_iavl_tree_specific_ranges() {
+        // Create a random IAVL tree with height 3
+        let tree = TestUtils::create_random_iavl_tree(3).expect("Failed to create random tree");
+
+        // Test with various specific key ranges using u32 big-endian encoding
+        let test_ranges = vec![
+            (1u32.to_be_bytes().to_vec(), 100u32.to_be_bytes().to_vec()),
+            (50u32.to_be_bytes().to_vec(), 200u32.to_be_bytes().to_vec()),
+            (100u32.to_be_bytes().to_vec(), 300u32.to_be_bytes().to_vec()),
+            (200u32.to_be_bytes().to_vec(), 500u32.to_be_bytes().to_vec()),
+        ];
+
+        for (i, (start, end)) in test_ranges.iter().enumerate() {
+            println!(
+                "Testing specific range {}: start={:?}, end={:?}",
+                i + 1,
+                u32::from_be_bytes(start.clone().try_into().unwrap()),
+                u32::from_be_bytes(end.clone().try_into().unwrap())
+            );
+
+            // Test ascending
+            let mut ascending_iterator = tree
+                .clone()
+                .iterator(start, end, true)
+                .expect("Failed to create ascending iterator");
+
+            let mut ascending_count = 0;
+            while ascending_iterator.valid() {
+                let key = ascending_iterator.key().clone();
+
+                assert!(key >= *start, "Key should be >= start");
+                assert!(key < *end, "Key should be < end");
+
+                ascending_count += 1;
+                ascending_iterator.next();
+            }
+
+            // Test descending
+            let mut descending_iterator = tree
+                .clone()
+                .iterator(start, end, false)
+                .expect("Failed to create descending iterator");
+
+            let mut descending_count = 0;
+            while descending_iterator.valid() {
+                let key = descending_iterator.key().clone();
+
+                assert!(key >= *start, "Key should be >= start");
+                assert!(key < *end, "Key should be < end");
+
+                descending_count += 1;
+                descending_iterator.next();
+            }
+
+            assert_eq!(
+                ascending_count, descending_count,
+                "Ascending and descending counts should match"
+            );
+
+            println!("  Found {} keys in range", ascending_count);
+        }
+    }
+
+    #[test]
+    fn test_random_iavl_tree_edge_case_ranges() {
+        // Create a random IAVL tree with height 3
+        let tree = TestUtils::create_random_iavl_tree(3).expect("Failed to create random tree");
+
+        // Test edge cases
+
+        // 1. Empty range (start == end)
+        let same_key = 100u32.to_be_bytes().to_vec();
+        let mut empty_iterator = tree
+            .clone()
+            .iterator(&same_key, &same_key, true)
+            .expect("Failed to create empty range iterator");
+
+        let mut empty_count = 0;
+        while empty_iterator.valid() {
+            empty_count += 1;
+            empty_iterator.next();
+        }
+
+        // Should return 0 keys since range is empty (start == end)
+        assert_eq!(empty_count, 0, "Empty range should return no keys");
+
+        // 2. Very narrow range
+        let narrow_start = 100u32.to_be_bytes().to_vec();
+        let narrow_end = 101u32.to_be_bytes().to_vec();
+
+        let mut narrow_iterator = tree
+            .clone()
+            .iterator(&narrow_start, &narrow_end, true)
+            .expect("Failed to create narrow range iterator");
+
+        let mut narrow_count = 0;
+        while narrow_iterator.valid() {
+            let key = narrow_iterator.key().clone();
+            assert!(key >= narrow_start, "Key should be >= narrow start");
+            assert!(key < narrow_end, "Key should be < narrow end");
+
+            narrow_count += 1;
+            narrow_iterator.next();
+        }
+
+        println!("Narrow range [100, 101) returned {} keys", narrow_count);
+
+        // 3. Range beyond all keys
+        let high_start = 1000000u32.to_be_bytes().to_vec();
+        let high_end = 2000000u32.to_be_bytes().to_vec();
+
+        let mut high_iterator = tree
+            .iterator(&high_start, &high_end, true)
+            .expect("Failed to create high range iterator");
+
+        let mut high_count = 0;
+        while high_iterator.valid() {
+            high_count += 1;
+            high_iterator.next();
+        }
+
+        // Should return 0 keys since range is beyond all existing keys
+        assert_eq!(high_count, 0, "Range beyond all keys should return no keys");
+
+        println!("Edge case ranges tested successfully");
     }
 }

@@ -11,6 +11,8 @@ pub fn encode_bytes(bytes: &[u8]) -> Vec<u8> {
     let mut result = Vec::with_capacity(1 + bytes_length);
     prost_encoding::encode_varint(bytes_length as u64, &mut result);
     result.extend_from_slice(bytes);
+
+    println!("Testing log: result: {}", result.len());
     result
 }
 

@@ -122,6 +122,9 @@ pub enum DBError {
     #[error("error: {0}")]
     Other(String),
 
+    #[error("empty root key")]
+    EmptyRootKey,
+
     #[error("poisoned")]
     PoisonedError,
 }
@@ -188,35 +191,50 @@ where
     // load its childern
     // `kf`: <version><none>
     pub fn get_node(&self, kf: Vec<u8>) -> Result<Arc<RwLock<Node>>, DBError> {
-        let (version, nonce) = NodeKeyFormat::extract_version_nonce(&kf).ok_or(
-            DBError::InvalidNodeKey(format!("invalid node key: {:?}", kf)),
-        )?;
-        let node_key = NodeKey { version, nonce };
-        let node_key = node_key.serialize();
+        let node_key = NodeKey::get_node_key(&kf).ok_or(DBError::InvalidNodeKey(format!(
+            "invalid node key: {:?}",
+            kf
+        )))?;
 
         // Check the cache
         if let Some(node) = self.cache.get(&kf) {
-            let node = Node::deserialize(&node_key, &node).map_err(|e| {
+            let node = Node::deserialize(&kf, &node).map_err(|e| {
                 DBError::DeserializationError(format!("deserialization error: {:?}", e))
             })?;
             return Ok(Arc::new(RwLock::new(*node)));
         }
 
-        let node = self.db.as_ref().unwrap().get(kf).unwrap().unwrap();
-        let node = Node::deserialize(&node_key, &node).unwrap();
+        let node_key = node_key.make_node_db_key(b's');
+
+        println!("Testing log: kf: {:?}", kf);
+
+        let node = self
+            .db
+            .as_ref()
+            .unwrap()
+            .get(node_key.to_vec())
+            .unwrap()
+            .unwrap();
+
+        println!("Testing log: node: {:?}", node);
+
+        let node = Node::deserialize(&kf, &node).unwrap();
+
+        println!("Testing log: node: {:?}", node);
 
         Ok(Arc::new(RwLock::new(*node)))
     }
 
-    fn save_node(&self, node: Box<Node>) -> Result<(), DBError> {
+    pub fn save_node(&self, node: Box<Node>) -> Result<(), DBError> {
         let node_encoded = node.serialize().unwrap();
         let nk = node.as_ref().node_key.clone().unwrap();
-        let key = NodeKeyFormat::new(nk.version, nk.nonce);
+        // TODO: use the key format to create the key
+        let key = nk.make_node_db_key(b's');
 
         self.db
             .as_ref()
             .unwrap()
-            .set(key.key_bytes(), node_encoded)
+            .set(key.to_vec(), node_encoded)
             .unwrap();
 
         Ok(())
